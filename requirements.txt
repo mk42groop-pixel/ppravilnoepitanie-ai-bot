@@ -1,23 +1,5 @@
-# Core
 python-telegram-bot==20.7
 flask==2.3.3
-aiohttp==3.8.5
-gunicorn==21.2.0
-
-# Database
-sqlalchemy==2.0.23
-alembic==1.12.1
-
-# Utils
+aiohttp==3.8.6
 python-dotenv==1.0.0
 requests==2.31.0
-cachetools==5.3.2
-psutil==5.9.6
-
-# Async
-asyncio-throttle==1.0.2
-aiofiles==23.2.1
-
-# Monitoring
-prometheus-client==0.18.0
-blinker==1.7.0
