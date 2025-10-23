@@ -12,7 +12,7 @@ import socket
 import sys
 import re
 from datetime import datetime, timedelta
-from flask import Flask
+from flask import Flask, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 
@@ -36,124 +36,18 @@ YANDEX_API_KEY = os.getenv('YANDEX_API_KEY')
 YANDEX_FOLDER_ID = os.getenv('YANDEX_FOLDER_ID')
 YANDEX_GPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 
-# ==================== СИСТЕМА ОДНОЭКЗЕМПЛЯРНОСТИ ====================
-
-class SingleInstance:
-    """Обеспечивает запуск только одного экземпляра приложения"""
-    def __init__(self, port=18888):
-        self.port = port
-        self.socket = None
-        
-    def __enter__(self):
-        """Пытается захватить порт - если не удалось, значит уже запущен другой экземпляр"""
-        try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.bind(('127.0.0.1', self.port))
-            self.socket.listen(1)
-            logger.info(f"🔒 Single instance lock acquired on port {self.port}")
-            return True
-        except socket.error as e:
-            logger.error(f"❌ Another instance is already running: {e}")
-            return False
-            
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Освобождает порт при завершении"""
-        if self.socket:
-            try:
-                self.socket.close()
-                logger.info("🔓 Single instance lock released")
-            except:
-                pass
-
-def check_single_instance():
-    """Проверяет, не запущен ли уже экземпляр бота"""
-    with SingleInstance() as is_first:
-        if not is_first:
-            logger.error("🚫 Bot is already running elsewhere. Exiting.")
-            sys.exit(1)
-        return True
-
-# ==================== GRACEFUL SHUTDOWN ====================
-
-class GracefulShutdown:
-    """Обеспечивает корректное завершение работы бота"""
-    def __init__(self):
-        self.shutdown_requested = False
-        self.application = None
-        
-    def setup_signal_handlers(self, application):
-        """Настраивает обработчики сигналов завершения"""
-        self.application = application
-        
-        def signal_handler(signum, frame):
-            logger.info(f"🛑 Received signal {signum}, initiating graceful shutdown...")
-            self.shutdown_requested = True
-            self.shutdown()
-            
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
-        # Регистрируем cleanup при нормальном завершении
-        atexit.register(self.cleanup)
-        
-    def shutdown(self):
-        """Корректная остановка бота"""
-        if self.application and not self.shutdown_requested:
-            logger.info("⏳ Stopping bot application...")
-            try:
-                # Останавливаем polling
-                if hasattr(self.application, 'updater') and self.application.updater.running:
-                    self.application.updater.stop()
-                
-                # Останавливаем application
-                self.application.stop()
-                self.application.shutdown()
-                
-                logger.info("✅ Bot stopped gracefully")
-            except Exception as e:
-                logger.error(f"Error during shutdown: {e}")
-            finally:
-                self.shutdown_requested = True
-                
-    def cleanup(self):
-        """Финальная очистка"""
-        logger.info("🧹 Performing final cleanup...")
-        
-    def should_stop(self):
-        """Проверяет, запрошено ли завершение"""
-        return self.shutdown_requested
-
-# Глобальный объект для graceful shutdown
-shutdown_manager = GracefulShutdown()
-
-# Flask app для health checks
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return """
-    <h1>🤖 Nutrition Bot is Running!</h1>
-    <p>Бот для создания персональных планов питания</p>
-    <p><a href="/health">Health Check</a></p>
-    <p>🕒 Last update: {}</p>
-    """.format(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-
-@app.route('/health')
-def health_check():
-    return {
-        "status": "healthy", 
-        "service": "nutrition-bot",
-        "timestamp": datetime.now().isoformat(),
-        "version": "6.0"
-    }
-
 # ==================== БАЗА ДАННЫХ ====================
 
 def init_database():
     """Инициализация базы данных"""
-    conn = sqlite3.connect('nutrition_bot.db')
+    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
     cursor = conn.cursor()
+    
+    # Включаем оптимизации для SQLite
+    cursor.execute('PRAGMA journal_mode=WAL')
+    cursor.execute('PRAGMA synchronous=NORMAL')
+    cursor.execute('PRAGMA cache_size=-64000')
+    cursor.execute('PRAGMA foreign_keys=ON')
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
@@ -209,13 +103,19 @@ def init_database():
         )
     ''')
     
+    # Создаем индексы для производительности
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_plans_user_id ON nutrition_plans(user_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_limits_user_id ON user_limits(user_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_checkins_user_date ON daily_checkins(user_id, date)')
+    
     conn.commit()
     conn.close()
-    logger.info("Database initialized")
+    logger.info("Database initialized with optimizations")
 
 def save_user(user_data):
     """Сохраняет пользователя в БД"""
-    conn = sqlite3.connect('nutrition_bot.db')
+    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
     cursor = conn.cursor()
     
     try:
@@ -240,7 +140,7 @@ def can_make_request(user_id):
         if is_admin(user_id):
             return True
             
-        conn = sqlite3.connect('nutrition_bot.db')
+        conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
         cursor = conn.cursor()
         
         cursor.execute('SELECT last_plan_date FROM user_limits WHERE user_id = ?', (user_id,))
@@ -266,7 +166,7 @@ def update_user_limit(user_id):
         if is_admin(user_id):
             return
             
-        conn = sqlite3.connect('nutrition_bot.db')
+        conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
         cursor = conn.cursor()
         
         current_time = datetime.now().isoformat()
@@ -287,7 +187,7 @@ def get_days_until_next_plan(user_id):
         if is_admin(user_id):
             return 0
             
-        conn = sqlite3.connect('nutrition_bot.db')
+        conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
         cursor = conn.cursor()
         
         cursor.execute('SELECT last_plan_date FROM user_limits WHERE user_id = ?', (user_id,))
@@ -309,7 +209,7 @@ def get_days_until_next_plan(user_id):
 
 def save_plan(user_id, plan_data):
     """Сохраняет план питания в БД"""
-    conn = sqlite3.connect('nutrition_bot.db')
+    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
     cursor = conn.cursor()
     
     try:
@@ -330,7 +230,7 @@ def save_plan(user_id, plan_data):
 
 def save_shopping_list(user_id, plan_id, shopping_list):
     """Сохраняет список покупок"""
-    conn = sqlite3.connect('nutrition_bot.db')
+    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
     cursor = conn.cursor()
     
     try:
@@ -346,7 +246,7 @@ def save_shopping_list(user_id, plan_id, shopping_list):
 
 def get_shopping_list(user_id, plan_id):
     """Получает список покупок"""
-    conn = sqlite3.connect('nutrition_bot.db')
+    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
     cursor = conn.cursor()
     
     try:
@@ -367,7 +267,7 @@ def get_shopping_list(user_id, plan_id):
 
 def update_checked_items(user_id, plan_id, checked_items):
     """Обновляет отмеченные товары"""
-    conn = sqlite3.connect('nutrition_bot.db')
+    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
     cursor = conn.cursor()
     
     try:
@@ -384,7 +284,7 @@ def update_checked_items(user_id, plan_id, checked_items):
 
 def save_checkin(user_id, weight, waist, wellbeing, sleep):
     """Сохраняет ежедневный чек-ин"""
-    conn = sqlite3.connect('nutrition_bot.db')
+    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
     cursor = conn.cursor()
     
     try:
@@ -400,7 +300,7 @@ def save_checkin(user_id, weight, waist, wellbeing, sleep):
 
 def get_user_stats(user_id):
     """Получает статистику пользователя"""
-    conn = sqlite3.connect('nutrition_bot.db')
+    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
     cursor = conn.cursor()
     
     try:
@@ -589,7 +489,7 @@ class GPTParser:
             ingredients = []
             for line in lines:
                 line = line.strip()
-                if line and not re.match(r'^(ингредиенты|состав|продукты)', line.lower()):
+                if line and not re.match(r'^(ингредиенты|состав|продукы)', line.lower()):
                     clean_line = re.sub(r'^[•\-*\d\.]\s*', '', line)
                     if clean_line and len(clean_line) > 3:
                         ingredients.append(f"• {clean_line}")
@@ -1050,233 +950,27 @@ class InteractiveMenu:
         ]
         return InlineKeyboardMarkup(keyboard)
 
-class InteractivePlan:
-    def __init__(self, plan_data, plan_id=None):
-        self.plan_data = plan_data
-        self.plan_id = plan_id
-        self.menu = InteractiveMenu()
-    
-    def get_meal_details(self, day_index, meal_index):
-        """Получает детали рецепта из структурированных данных"""
-        try:
-            if day_index < len(self.plan_data['days']):
-                day = self.plan_data['days'][day_index]
-                if meal_index < len(day['meals']):
-                    meal = day['meals'][meal_index]
-                    return self._format_meal_details(meal, day['name'])
-        except Exception as e:
-            logger.error(f"Error getting meal details: {e}")
-        
-        return self._get_fallback_recipe(day_index, meal_index)
-    
-    def _format_meal_details(self, meal, day_name):
-        """Форматирует детали рецепта"""
-        nutrition_text = ""
-        if meal.get('nutrition'):
-            nutrition = meal['nutrition']
-            nutrition_parts = []
-            if nutrition.get('protein'):
-                nutrition_parts.append(f"Б: {nutrition['protein']}")
-            if nutrition.get('fat'):
-                nutrition_parts.append(f"Ж: {nutrition['fat']}")
-            if nutrition.get('carbs'):
-                nutrition_parts.append(f"У: {nutrition['carbs']}")
-            if nutrition_parts:
-                nutrition_text = f"\n📊 БЖУ: {', '.join(nutrition_parts)}"
-        
-        # СОВЕТЫ ПО ПРИЕМУ ПИЩИ И ВОДНОМУ РЕЖИМУ
-        eating_tips = """
-💡 СОВЕТЫ ПО ПРИЕМУ ПИЩИ:
-• Ешьте медленно, тщательно пережевывая
-• Не отвлекайтесь на телевизор/телефон
-• Наслаждайтесь каждым кусочком
-• Завершите прием при легком чувстве сытости
+# ==================== FLASK APP ====================
 
-💧 ВОДНЫЙ РЕЖИМ:
-• За 30 мин до: 200 мл воды
-• Во время: не пить
-• Через 1 час после: 200 мл воды
-"""
-        
-        return f"""
-{meal['emoji']} {meal['type']} - {day_name}
+app = Flask(__name__)
 
-{meal['name']}
-⏰ {meal['time']} | 🍽️ {meal['calories']}
+@app.route('/')
+def home():
+    return """
+    <h1>🤖 Nutrition Bot is Running!</h1>
+    <p>Бот для создания персональных планов питания</p>
+    <p><a href="/health">Health Check</a></p>
+    <p>🕒 Last update: {}</p>
+    """.format(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-📋 Ингредиенты:
-{meal['ingredients']}
-
-👨‍🍳 Приготовление:
-{meal['instructions']}
-
-⏱️ Время готовки: {meal.get('cooking_time', '15-20 минут')}
-{nutrition_text}
-{eating_tips}
-🚫 Приготовление: варка, тушение, запекание (гриль исключен)
-        """
-    
-    def _get_fallback_recipe(self, day_index, meal_index):
-        """Резервный рецепт"""
-        return f"""
-🍳 РЕЦЕПТ - ДЕНЬ {day_index + 1}
-
-Индивидуальный рецепт будет загружен
-⏰ 8:00 | 🍽️ ~350 ккал
-
-📋 Ингредиенты:
-• Продукты будут указаны в плане
-
-👨‍🍳 Приготовление:
-1. Следуйте инструкциям плана питания
-2. Используйте свежие продукты
-3. Готовьте с удовольствием
-
-⏱️ Время готовки: 15-20 минут
-
-💡 СОВЕТЫ ПО ПРИЕМУ ПИЩИ:
-• Ешьте медленно, тщательно пережевывая
-• Наслаждайтесь каждым кусочком
-
-💧 ВОДНЫЙ РЕЖИМ:
-• За 30 мин до: 200 мл воды
-• Во время: не пить
-• Через 1 час после: 200 мл воды
-
-🚫 Приготовление: варка, тушение, запекание (гриль исключен)
-        """
-    
-    def get_water_regime_text(self):
-        """Возвращает текст водного режима"""
-        water_regime = self.plan_data.get('water_regime', '1.5-2 литра в день')
-        
-        return f"""
-💧 ВОДНЫЙ РЕЖИМ
-
-📊 Рекомендации для вас:
-
-⏰ УТРО (7:00):
-• 1-2 стакана теплой воды натощак
-• Активирует метаболизм
-• Подготавливает ЖКТ к работе
-
-🍽️ ДО ЕДЫ (за 30 минут):
-• 1 стакан воды комнатной температуры
-• Подготавливает желудок к приему пищи
-• Снижает аппетит
-
-🚫 ВО ВРЕМЯ ЕДЫ:
-• Не пить воду во время приема пищи
-• Это мешает пищеварению
-• Разбавляет желудочный сок
-
-🕒 ПОСЛЕ ЕДЫ (через 1 час):
-• 1 стакан воды
-• Помогает усвоению nutrients
-• Поддерживает гидратацию
-
-📈 СУТОЧНАЯ НОРМА:
-• 35 мл на 1 кг веса
-• Ваша норма: {water_regime}
-• Равномерно в течение дня
-
-💡 СОВЕТЫ:
-• Носите с собой бутылку воды
-• Пейте маленькими глотками
-• Используйте напоминания
-"""
-    
-    def get_shopping_list_text(self, checked_items=None):
-        """Форматирует список покупок с отметками"""
-        if checked_items is None:
-            checked_items = []
-        
-        shopping_list = self.plan_data.get('shopping_list', '')
-        items = shopping_list.split('\n') if shopping_list else []
-        
-        if not items:
-            items = self._generate_default_shopping_list().split('\n')
-        
-        formatted_items = []
-        checked_count = 0
-        
-        for i, item in enumerate(items):
-            if item.strip():
-                is_checked = i in checked_items
-                marker = "✅" if is_checked else "☐"
-                if is_checked:
-                    checked_count += 1
-                formatted_items.append(f"{marker} {item}")
-        
-        progress = f"\n\n📊 Прогресс: {checked_count}/{len(formatted_items)} товаров"
-        
-        return f"""
-🛒 ИНТЕРАКТИВНЫЙ СПИСОК ПОКУПОК
-
-📋 Нажмите на товар для отметки:
-
-{chr(10).join(formatted_items[:25])}
-{progress}
-
-💡 Советы:
-• Отмечайте купленные товары
-• Берите список с собой в магазин
-• Покупайте сезонные продукты
-        """
-    
-    def get_shopping_list_stats(self, checked_items):
-        """Получает статистику списка покупок"""
-        shopping_list = self.plan_data.get('shopping_list', '')
-        items = shopping_list.split('\n') if shopping_list else []
-        
-        if not items:
-            items = self._generate_default_shopping_list().split('\n')
-        
-        total_count = len([item for item in items if item.strip()])
-        checked_count = len(checked_items)
-        
-        return checked_count, total_count
-    
-    def toggle_item(self, item_index, checked_items):
-        """Переключает отметку товара"""
-        if item_index in checked_items:
-            checked_items.remove(item_index)
-        else:
-            checked_items.append(item_index)
-        return checked_items
-    
-    def clear_checked_items(self):
-        """Очищает все отметки"""
-        return []
-    
-    def _generate_default_shopping_list(self):
-        """Генерирует стандартный список покупок"""
-        return """Куриная грудка - 700г
-Филе индейки - 500г
-Белая рыба (треска, минтай) - 600г
-Говядина нежирная - 400г
-Яйца - 10 шт
-Творог 5% - 500г
-Йогурт натуральный - 400г
-Молоко 2.5% - 1 л
-Сметана 15% - 200г
-Сыр твердый - 150г
-Помидоры - 500г
-Огурцы - 500г
-Капуста белокочанная - 500г
-Морковь - 300г
-Лук репчатый - 300г
-Чеснок - 1 головка
-Зелень (петрушка, укроп) - 1 пучок
-Яблоки - 500г
-Бананы - 500г
-Апельсины - 300г
-Гречка - 300г
-Овсяные хлопья - 300г
-Рис бурый - 300г
-Хлеб ржаной - 1 буханка
-Масло оливковое - 150мл
-Масло подсолнечное - 150мл"""
+@app.route('/health')
+def health_check():
+    return {
+        "status": "healthy", 
+        "service": "nutrition-bot",
+        "timestamp": datetime.now().isoformat(),
+        "version": "6.0"
+    }
 
 # ==================== ОСНОВНОЙ КЛАСС БОТА ====================
 
@@ -1294,7 +988,6 @@ class NutritionBot:
             self.menu = InteractiveMenu()
             self._setup_handlers()
             
-            shutdown_manager.setup_signal_handlers(self.application)
             logger.info("✅ Bot initialized successfully")
         except Exception as e:
             logger.error(f"❌ Failed to initialize bot: {e}")
@@ -1365,8 +1058,6 @@ class NutritionBot:
             # Навигация
             elif data == "back_to_main":
                 await self._show_main_menu(query)
-            elif data == "back_to_days":
-                await self._show_days_menu(query, context)
             
             # Ввод данных плана
             elif data.startswith("gender_"):
@@ -1385,28 +1076,6 @@ class NutritionBot:
                 await self._handle_sleep(query, context, data)
             elif data == "back_to_wellbeing":
                 await self._handle_checkin(query, context)
-            
-            # Интерактивный план
-            elif data.startswith("day_"):
-                await self._handle_day_selection(query, context, data)
-            elif data.startswith("meal_"):
-                await self._handle_meal_selection(query, context, data)
-            
-            # Список покупок
-            elif data == "shopping_list":
-                await self._handle_shopping_list(query, context)
-            elif data == "back_to_shopping_list":
-                await self._handle_shopping_list(query, context)
-            elif data.startswith("toggle_"):
-                await self._handle_toggle_item(query, context, data)
-            elif data == "clear_checked":
-                await self._handle_clear_checked(query, context)
-            elif data == "save_shopping_list":
-                await self._handle_save_shopping_list(query, context)
-            
-            # Водный режим
-            elif data == "water_regime":
-                await self._handle_water_regime(query, context)
                 
         except Exception as e:
             logger.error(f"Error in callback handler: {e}")
@@ -1424,10 +1093,6 @@ class NutritionBot:
     async def _handle_create_plan(self, query, context):
         """Обработчик создания плана"""
         user_id = query.from_user.id
-        
-        if not is_admin(user_id) and not await self._check_subscription(user_id):
-            await self._ask_for_subscription(query)
-            return
             
         if not is_admin(user_id) and not can_make_request(user_id):
             days_remaining = get_days_until_next_plan(user_id)
@@ -1581,162 +1246,10 @@ class NutritionBot:
             reply_markup=self.menu.get_main_menu()
         )
     
-    # ==================== ИНТЕРАКТИВНЫЙ ПЛАН ====================
-    
-    async def _handle_day_selection(self, query, context, data):
-        """Обработчик выбора дня"""
-        day_index = int(data.split('_')[1])
-        interactive_plan = context.user_data.get('interactive_plan')
-        
-        await query.edit_message_text(
-            f"🍽️ {interactive_plan.menu.days[day_index]}\n\nВыберите прием пищи:",
-            reply_markup=interactive_plan.menu.get_meals_keyboard(day_index)
-        )
-    
-    async def _handle_meal_selection(self, query, context, data):
-        """Обработчик выбора приема пищи"""
-        _, day_index, meal_index = data.split('_')
-        day_index = int(day_index)
-        meal_index = int(meal_index)
-        interactive_plan = context.user_data.get('interactive_plan')
-        
-        recipe_text = interactive_plan.get_meal_details(day_index, meal_index)
-        
-        keyboard = [
-            [InlineKeyboardButton("↩️ НАЗАД К ПРИЕМАМ", callback_data=f"day_{day_index}")],
-            [InlineKeyboardButton("🏠 ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
-        ]
-        
-        await query.edit_message_text(
-            recipe_text,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    async def _show_days_menu(self, query, context):
-        """Показывает меню дней"""
-        interactive_plan = context.user_data.get('interactive_plan')
-        await query.edit_message_text(
-            "🎉 ВАШ ПЛАН ПИТАНИЯ НА 7 ДНЕЙ!\n\n📅 Выберите день:",
-            reply_markup=interactive_plan.menu.get_days_keyboard()
-        )
-    
-    # ==================== ИНТЕРАКТИВНЫЙ СПИСОК ПОКУПОК ====================
-    
-    async def _handle_shopping_list(self, query, context):
-        """Обработчик списка покупок"""
-        interactive_plan = context.user_data.get('interactive_plan')
-        user_id = query.from_user.id
-        
-        if not interactive_plan or not interactive_plan.plan_id:
-            await query.edit_message_text(
-                "❌ Список покупок недоступен\nСоздайте новый план питания",
-                reply_markup=self.menu.get_main_menu()
-            )
-            return
-        
-        # Получаем список покупок из БД
-        shopping_data = get_shopping_list(user_id, interactive_plan.plan_id)
-        checked_items = shopping_data['checked_items'] if shopping_data else []
-        
-        checked_count, total_count = interactive_plan.get_shopping_list_stats(checked_items)
-        shopping_text = interactive_plan.get_shopping_list_text(checked_items)
-        
-        await query.edit_message_text(
-            shopping_text,
-            reply_markup=self.menu.get_shopping_list_keyboard(checked_count, total_count)
-        )
-    
-    async def _handle_toggle_item(self, query, context, data):
-        """Обработчик переключения отметки товара"""
-        interactive_plan = context.user_data.get('interactive_plan')
-        user_id = query.from_user.id
-        
-        if not interactive_plan or not interactive_plan.plan_id:
-            await query.answer("❌ Ошибка доступа к списку")
-            return
-        
-        # Получаем данные из БД
-        shopping_data = get_shopping_list(user_id, interactive_plan.plan_id)
-        checked_items = shopping_data['checked_items'] if shopping_data else []
-        
-        # Определяем действие и индекс товара
-        action, item_index = data.split('_')[1], int(data.split('_')[2])
-        
-        if action == 'check':
-            checked_items = interactive_plan.toggle_item(item_index, checked_items)
-        elif action == 'uncheck':
-            checked_items = interactive_plan.toggle_item(item_index, checked_items)
-        
-        # Сохраняем в БД
-        update_checked_items(user_id, interactive_plan.plan_id, checked_items)
-        
-        # Показываем обновленный список
-        checked_count, total_count = interactive_plan.get_shopping_list_stats(checked_items)
-        shopping_text = interactive_plan.get_shopping_list_text(checked_items)
-        
-        await query.edit_message_text(
-            shopping_text,
-            reply_markup=self.menu.get_shopping_list_keyboard(checked_count, total_count)
-        )
-        
-        action_text = "отмечен" if action == "check" else "снята отметка"
-        await query.answer(f"✅ Товар {action_text}")
-    
-    async def _handle_clear_checked(self, query, context):
-        """Обработчик очистки отметок"""
-        interactive_plan = context.user_data.get('interactive_plan')
-        user_id = query.from_user.id
-        
-        if not interactive_plan or not interactive_plan.plan_id:
-            await query.answer("❌ Ошибка доступа к списку")
-            return
-        
-        # Очищаем отметки
-        checked_items = interactive_plan.clear_checked_items()
-        update_checked_items(user_id, interactive_plan.plan_id, checked_items)
-        
-        # Показываем обновленный список
-        shopping_text = interactive_plan.get_shopping_list_text(checked_items)
-        
-        await query.edit_message_text(
-            shopping_text,
-            reply_markup=self.menu.get_shopping_list_keyboard(0, 0)
-        )
-        
-        await query.answer("✅ Все отметки очищены")
-    
-    async def _handle_save_shopping_list(self, query, context):
-        """Обработчик сохранения списка"""
-        await query.answer("✅ Список покупок сохранен в вашем плане!")
-    
-    # ==================== ВОДНЫЙ РЕЖИМ ====================
-    
-    async def _handle_water_regime(self, query, context):
-        """Обработчик водного режима"""
-        interactive_plan = context.user_data.get('interactive_plan')
-        
-        if not interactive_plan:
-            await query.edit_message_text(
-                "❌ Водный режим недоступен\nСоздайте новый план питания",
-                reply_markup=self.menu.get_main_menu()
-            )
-            return
-        
-        water_text = interactive_plan.get_water_regime_text()
-        
-        await query.edit_message_text(
-            water_text,
-            reply_markup=self.menu.get_water_regime_keyboard()
-        )
-    
     # ==================== ОБРАБОТКА СООБЩЕНИЙ ====================
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик текстовых сообщений"""
-        if shutdown_manager.should_stop():
-            await update.message.reply_text("❌ Бот находится в процессе завершения работы.")
-            return
-            
         user_id = update.effective_user.id
         text = update.message.text
         
@@ -1775,16 +1288,12 @@ class NutritionBot:
             plan_id = save_plan(user_data['user_id'], plan_data)
             update_user_limit(user_data['user_id'])
             
-            # Создаем интерактивный план
-            interactive_plan = InteractivePlan(plan_data, plan_id)
-            context.user_data['interactive_plan'] = interactive_plan
-            
             await processing_msg.delete()
             
             await update.message.reply_text(
-                "🎉 ВАШ ПЛАН ПИТАНИЯ НА 7 ДНЕЙ!\n\n"
-                "📅 Выберите день для просмотра рецептов:",
-                reply_markup=interactive_plan.menu.get_days_keyboard()
+                "🎉 ВАШ ПЛАН ПИТАНИЯ ГОТОВ!\n\n"
+                "📋 Используйте меню для навигации:",
+                reply_markup=self.menu.get_main_menu()
             )
             
             context.user_data['awaiting_input'] = None
@@ -1968,31 +1477,6 @@ class NutritionBot:
         parser = GPTParser()
         return parser._create_fallback_plan(user_data)
     
-    # ==================== ПРОВЕРКА ПОДПИСКИ ====================
-    
-    async def _check_subscription(self, user_id):
-        """Проверяет подписку на канал"""
-        try:
-            if is_admin(user_id):
-                return True
-            # Временно разрешаем всем
-            return True
-        except Exception as e:
-            logger.error(f"Error checking subscription: {e}")
-            return True
-    
-    async def _ask_for_subscription(self, query):
-        """Просит подписаться на канал"""
-        keyboard = [
-            [InlineKeyboardButton("📢 ПОДПИСАТЬСЯ", url=f"https://t.me/{CHANNEL_USERNAME[1:]}")],
-            [InlineKeyboardButton("✅ Я ПОДПИСАЛСЯ", callback_data="cmd_create_plan")],
-            [InlineKeyboardButton("🏠 ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
-        ]
-        await query.edit_message_text(
-            f"❌ Для создания плана подпишитесь на канал {CHANNEL_USERNAME}",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ошибок"""
         logger.error(f"Exception: {context.error}")
@@ -2030,10 +1514,6 @@ class NutritionBot:
 def main():
     """Главная функция"""
     logger.info("🚀 Starting nutrition bot services...")
-    
-    if not check_single_instance():
-        logger.error("❌ Another instance is already running. Exiting.")
-        return
     
     try:
         bot = NutritionBot()
