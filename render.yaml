@@ -8,11 +8,11 @@ services:
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
-        value: your_telegram_bot_token_here
+        sync: false
       - key: YANDEX_API_KEY
-        value: your_yandex_gpt_api_key_here
+        sync: false  
       - key: YANDEX_FOLDER_ID
-        value: your_yandex_folder_id_here
+        sync: false
       - key: PORT
         value: 10000
     healthCheckPath: /health
