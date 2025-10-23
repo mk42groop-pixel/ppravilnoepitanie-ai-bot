@@ -665,10 +665,10 @@ class InteractiveMenu:
     def get_main_menu(self):
         """Главное меню команд"""
         keyboard = [
-            [InlineKeyboardButton("📊 СОЗДАТЬ ПЛАН", callback_data="cmd_create_plan")],
-            [InlineKeyboardButton("📈 ЧЕК-ИН", callback_data="cmd_checkin")],
-            [InlineKeyboardButton("📊 СТАТИСТИКА", callback_data="cmd_stats")],
-            [InlineKeyboardButton("❓ ПОМОЩЬ", callback_data="cmd_help")]
+            [InlineKeyboardButton("📊 СОЗДАТЬ ПЛАН", callback_data="create_plan")],
+            [InlineKeyboardButton("📈 ЧЕК-ИН", callback_data="checkin")],
+            [InlineKeyboardButton("📊 СТАТИСТИКА", callback_data="stats")],
+            [InlineKeyboardButton("❓ ПОМОЩЬ", callback_data="help")]
         ]
         return InlineKeyboardMarkup(keyboard)
     
@@ -678,21 +678,21 @@ class InteractiveMenu:
             keyboard = [
                 [InlineKeyboardButton("👨 МУЖЧИНА", callback_data="gender_male")],
                 [InlineKeyboardButton("👩 ЖЕНЩИНА", callback_data="gender_female")],
-                [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_to_main")]
+                [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_main")]
             ]
         elif step == 2:  # Выбор цели
             keyboard = [
                 [InlineKeyboardButton("🎯 ПОХУДЕНИЕ", callback_data="goal_weight_loss")],
                 [InlineKeyboardButton("💪 НАБОР МАССЫ", callback_data="goal_mass")],
                 [InlineKeyboardButton("⚖️ ПОДДЕРЖАНИЕ", callback_data="goal_maintain")],
-                [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_to_gender")]
+                [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_gender")]
             ]
         elif step == 3:  # Выбор активности
             keyboard = [
                 [InlineKeyboardButton("🏃‍♂️ ВЫСОКАЯ", callback_data="activity_high")],
                 [InlineKeyboardButton("🚶‍♂️ СРЕДНЯЯ", callback_data="activity_medium")],
                 [InlineKeyboardButton("💤 НИЗКАЯ", callback_data="activity_low")],
-                [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_to_goal")]
+                [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_goal")]
             ]
         
         return InlineKeyboardMarkup(keyboard)
@@ -791,24 +791,25 @@ class NutritionBot:
         await query.answer()
         
         data = query.data
+        logger.info(f"📨 Callback received: {data}")
         
         try:
-            # Главные команды
-            if data == "cmd_create_plan":
+            # Главные команды меню
+            if data == "create_plan":
                 await self._handle_create_plan(query, context)
-            elif data == "cmd_checkin":
+            elif data == "checkin":
                 await self._handle_checkin(query, context)
-            elif data == "cmd_stats":
+            elif data == "stats":
                 await self._handle_stats(query, context)
-            elif data == "cmd_help":
+            elif data == "help":
                 await self._handle_help(query, context)
             
-            # Навигация
-            elif data == "back_to_main":
+            # Навигация назад
+            elif data == "back_main":
                 await self._show_main_menu(query)
-            elif data == "back_to_gender":
+            elif data == "back_gender":
                 await self._handle_create_plan(query, context)
-            elif data == "back_to_goal":
+            elif data == "back_goal":
                 await self._handle_gender_back(query, context)
             
             # Ввод данных плана
@@ -818,10 +819,215 @@ class NutritionBot:
                 await self._handle_goal(query, context, data)
             elif data.startswith("activity_"):
                 await self._handle_activity(query, context, data)
+            else:
+                logger.warning(f"⚠️ Unknown callback data: {data}")
+                await query.edit_message_text("❌ Неизвестная команда", reply_markup=self.menu.get_main_menu())
                 
         except Exception as e:
-            logger.error(f"Error in callback handler: {e}")
-            await query.edit_message_text("❌ Произошла ошибка. Попробуйте снова.")
+            logger.error(f"❌ Error in callback handler: {e}")
+            await query.edit_message_text(
+                "❌ Произошла ошибка. Попробуйте снова.",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
+    async def _handle_create_plan(self, query, context):
+        """Обработчик создания плана"""
+        try:
+            user_id = query.from_user.id
+            
+            # Проверяем лимиты
+            if not is_admin(user_id) and not can_make_request(user_id):
+                days_remaining = get_days_until_next_plan(user_id)
+                await query.edit_message_text(
+                    f"⏳ Вы уже запрашивали план питания\nСледующий доступен через {days_remaining} дней",
+                    reply_markup=self.menu.get_main_menu()
+                )
+                return
+            
+            # Инициализируем данные плана
+            context.user_data['plan_data'] = {}
+            context.user_data['plan_step'] = 1
+            
+            logger.info(f"🔧 Starting plan creation for user {user_id}")
+            
+            await query.edit_message_text(
+                "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n1️⃣ Выберите ваш пол:",
+                reply_markup=self.menu.get_plan_data_input(step=1)
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ Error in create plan handler: {e}")
+            await query.edit_message_text(
+                "❌ Ошибка при создании плана. Попробуйте снова.",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
+    async def _handle_gender_back(self, query, context):
+        """Назад к выбору пола"""
+        try:
+            # Сохраняем текущие данные, но возвращаемся к выбору пола
+            if 'plan_data' in context.user_data:
+                # Очищаем только выбранный пол, сохраняем остальные данные
+                if 'gender' in context.user_data['plan_data']:
+                    del context.user_data['plan_data']['gender']
+            
+            context.user_data['plan_step'] = 1
+            
+            await query.edit_message_text(
+                "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n1️⃣ Выберите ваш пол:",
+                reply_markup=self.menu.get_plan_data_input(step=1)
+            )
+        except Exception as e:
+            logger.error(f"❌ Error in gender back handler: {e}")
+            await query.edit_message_text(
+                "❌ Ошибка навигации. Попробуйте с начала.",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
+    async def _handle_gender(self, query, context, data):
+        """Обработчик выбора пола"""
+        try:
+            gender_map = {
+                "gender_male": "МУЖЧИНА",
+                "gender_female": "ЖЕНЩИНА"
+            }
+            
+            context.user_data['plan_data']['gender'] = gender_map[data]
+            context.user_data['plan_step'] = 2
+            
+            await query.edit_message_text(
+                "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n2️⃣ Выберите вашу цель:",
+                reply_markup=self.menu.get_plan_data_input(step=2)
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ Error in gender handler: {e}")
+            await query.edit_message_text(
+                "❌ Ошибка при выборе пола. Попробуйте снова.",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
+    async def _handle_goal(self, query, context, data):
+        """Обработчик выбора цели"""
+        try:
+            goal_map = {
+                "goal_weight_loss": "ПОХУДЕНИЕ",
+                "goal_mass": "НАБОР МАССЫ", 
+                "goal_maintain": "ПОДДЕРЖАНИЕ"
+            }
+            
+            context.user_data['plan_data']['goal'] = goal_map[data]
+            context.user_data['plan_step'] = 3
+            
+            await query.edit_message_text(
+                "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n3️⃣ Выберите уровень активности:",
+                reply_markup=self.menu.get_plan_data_input(step=3)
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ Error in goal handler: {e}")
+            await query.edit_message_text(
+                "❌ Ошибка при выборе цели. Попробуйте снова.",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
+    async def _handle_activity(self, query, context, data):
+        """Обработчик выбора активности"""
+        try:
+            activity_map = {
+                "activity_high": "ВЫСОКАЯ",
+                "activity_medium": "СРЕДНЯЯ",
+                "activity_low": "НИЗКАЯ"
+            }
+            
+            context.user_data['plan_data']['activity'] = activity_map[data]
+            context.user_data['awaiting_input'] = 'plan_details'
+            
+            await query.edit_message_text(
+                "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n4️⃣ Введите ваши данные в формате:\n"
+                "Возраст, Рост (см), Вес (кг)\n\n"
+                "Пример: 30, 180, 75"
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ Error in activity handler: {e}")
+            await query.edit_message_text(
+                "❌ Ошибка при выборе активности. Попробуйте снова.",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
+    async def _handle_checkin(self, query, context):
+        """Обработчик чек-ина"""
+        try:
+            await query.edit_message_text(
+                "📈 Функция чек-ина в разработке...",
+                reply_markup=self.menu.get_main_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error in checkin handler: {e}")
+            await query.edit_message_text(
+                "❌ Ошибка при открытии чек-ина",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
+    async def _handle_stats(self, query, context):
+        """Обработчик статистики"""
+        try:
+            user_id = query.from_user.id
+            stats = get_user_stats(user_id)
+            
+            if not stats:
+                await query.edit_message_text(
+                    "📊 У вас пока нет данных для статистики",
+                    reply_markup=self.menu.get_main_menu()
+                )
+                return
+            
+            stats_text = "📊 ВАША СТАТИСТИКА (последние 7 дней):\n\n"
+            for stat in stats:
+                date, weight, waist, wellbeing, sleep = stat
+                stats_text += f"📅 {date[:10]}: Вес {weight}кг, Талия {waist}см\n"
+                stats_text += f"   Самочувствие: {wellbeing}/5, Сон: {sleep}/5\n\n"
+            
+            await query.edit_message_text(
+                stats_text,
+                reply_markup=self.menu.get_main_menu()
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in stats handler: {e}")
+            await query.edit_message_text(
+                "❌ Ошибка при получении статистики",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
+    async def _handle_help(self, query, context):
+        """Обработчик помощи"""
+        help_text = """
+❓ ПОМОЩЬ ПО БОТУ
+
+📊 СОЗДАТЬ ПЛАН:
+• Создает персонализированный план питания на 7 дней
+• Учитывает ваш пол, цель, активность и параметры
+• Доступен раз в 7 дней (админам - безлимитно)
+
+📈 ЧЕК-ИН:
+• Ежедневное отслеживание прогресса
+• Запись веса, обхвата талии, самочувствия
+
+📊 СТАТИСТИКА:
+• Просмотр вашего прогресса
+• Графики изменений параметров
+
+💡 Советы:
+• Вводите данные точно
+• Следуйте плану питания
+• Регулярно делайте чек-ин
+"""
+        await query.edit_message_text(
+            help_text,
+            reply_markup=self.menu.get_main_menu()
+        )
     
     async def _show_main_menu(self, query):
         """Показывает главное меню"""
@@ -830,161 +1036,24 @@ class NutritionBot:
             reply_markup=self.menu.get_main_menu()
         )
     
-    async def _handle_create_plan(self, query, context):
-        """Обработчик создания плана"""
-        user_id = query.from_user.id
-            
-        if not is_admin(user_id) and not can_make_request(user_id):
-            days_remaining = get_days_until_next_plan(user_id)
-            await query.edit_message_text(
-                f"⏳ Вы уже запрашивали план питания\nСледующий доступен через {days_remaining} дней",
-                reply_markup=self.menu.get_main_menu()
-            )
-            return
-        
-        # Инициализируем данные плана
-        context.user_data['plan_data'] = {}
-        context.user_data['plan_step'] = 1
-        
-        await query.edit_message_text(
-            "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n1️⃣ Выберите ваш пол:",
-            reply_markup=self.menu.get_plan_data_input(step=1)
-        )
-    
-    async def _handle_gender(self, query, context, data):
-        """Обработчик выбора пола"""
-        try:
-            gender = 'Мужчина' if data == 'gender_male' else 'Женщина'
-            context.user_data['plan_data']['gender'] = gender
-            context.user_data['plan_step'] = 2
-            
-            await query.edit_message_text(
-                f"✅ Пол: {gender}\n\n2️⃣ Выберите вашу цель:",
-                reply_markup=self.menu.get_plan_data_input(step=2)
-            )
-        except Exception as e:
-            logger.error(f"Error in gender handler: {e}")
-            await query.edit_message_text("❌ Ошибка при выборе пола. Попробуйте снова.", reply_markup=self.menu.get_main_menu())
-    
-    async def _handle_gender_back(self, query, context):
-        """Назад к выбору пола"""
-        context.user_data['plan_step'] = 1
-        await query.edit_message_text(
-            "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n1️⃣ Выберите ваш пол:",
-            reply_markup=self.menu.get_plan_data_input(step=1)
-        )
-    
-    async def _handle_goal(self, query, context, data):
-        """Обработчик выбора цели"""
-        try:
-            goal_map = {
-                'weight_loss': 'похудение', 
-                'mass': 'набор массы', 
-                'maintain': 'поддержание'
-            }
-            goal = goal_map[data.split('_')[1]]
-            context.user_data['plan_data']['goal'] = goal
-            context.user_data['plan_step'] = 3
-            
-            await query.edit_message_text(
-                f"✅ Пол: {context.user_data['plan_data']['gender']}\n"
-                f"✅ Цель: {goal}\n\n"
-                "3️⃣ Выберите уровень активности:",
-                reply_markup=self.menu.get_plan_data_input(step=3)
-            )
-        except Exception as e:
-            logger.error(f"Error in goal handler: {e}")
-            await query.edit_message_text("❌ Ошибка при выборе цели. Попробуйте снова.", reply_markup=self.menu.get_main_menu())
-    
-    async def _handle_activity(self, query, context, data):
-        """Обработчик выбора активности"""
-        try:
-            activity_map = {
-                'high': 'высокая', 
-                'medium': 'средняя', 
-                'low': 'низкая'
-            }
-            activity = activity_map[data.split('_')[1]]
-            context.user_data['plan_data']['activity'] = activity
-            context.user_data['plan_step'] = 4
-            context.user_data['awaiting_input'] = 'plan_details'
-            
-            await query.edit_message_text(
-                f"✅ Пол: {context.user_data['plan_data']['gender']}\n"
-                f"✅ Цель: {context.user_data['plan_data']['goal']}\n"
-                f"✅ Активность: {activity}\n\n"
-                "4️⃣ Введите через запятую:\n"
-                "• Возраст (лет)\n• Рост (см)\n• Вес (кг)\n\n"
-                "📝 Пример: 30, 180, 80\n\n"
-                "Или нажмите назад для изменения данных:",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_to_goal")]
-                ])
-            )
-        except Exception as e:
-            logger.error(f"Error in activity handler: {e}")
-            await query.edit_message_text("❌ Ошибка при выборе активности. Попробуйте снова.", reply_markup=self.menu.get_main_menu())
-    
-    async def _handle_checkin(self, query, context):
-        """Обработчик чек-ина"""
-        await query.edit_message_text(
-            "📈 Чек-ин временно недоступен\nИспользуйте создание плана питания",
-            reply_markup=self.menu.get_main_menu()
-        )
-    
-    async def _handle_stats(self, query, context):
-        """Обработчик статистики"""
-        user_id = query.from_user.id
-        checkins = get_user_stats(user_id)
-        
-        if not checkins:
-            await query.edit_message_text(
-                "📊 У вас пока нет данных для статистики\n\n"
-                "💡 Используйте чек-ин для отслеживания прогресса",
-                reply_markup=self.menu.get_main_menu()
-            )
-            return
-        
-        stats_text = "📊 ВАША СТАТИСТИКА\n\n"
-        for checkin in reversed(checkins):
-            date_str = datetime.fromisoformat(checkin[0]).strftime('%d.%m')
-            stats_text += f"📅 {date_str}: Вес {checkin[1]}кг, Талия {checkin[2]}см\n"
-        
-        await query.edit_message_text(
-            stats_text,
-            reply_markup=self.menu.get_main_menu()
-        )
-    
-    async def _handle_help(self, query, context):
-        """Обработчик помощи"""
-        help_text = """
-❓ ПОМОЩЬ ПО БОТУ
-
-📊 СОЗДАТЬ ПЛАН - индивидуальный AI-план питания
-📈 ЧЕК-ИН - ежедневное отслеживание прогресса  
-📊 СТАТИСТИКА - ваши результаты за 7 дней
-
-💡 Все команды доступны через меню
-🔒 Ваши данные конфиденциальны
-
-🤖 Бот работает в тестовом режиме
-✅ Все функции бесплатны
-"""
-        await query.edit_message_text(
-            help_text,
-            reply_markup=self.menu.get_main_menu()
-        )
-    
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик текстовых сообщений"""
-        user_id = update.effective_user.id
-        text = update.message.text
-        
-        if context.user_data.get('awaiting_input') == 'plan_details':
-            await self._process_plan_details(update, context, text)
-        else:
+        try:
+            text = update.message.text
+            user_id = update.effective_user.id
+            
+            if context.user_data.get('awaiting_input') == 'plan_details':
+                await self._process_plan_details(update, context, text)
+            else:
+                await update.message.reply_text(
+                    "🤖 Используйте меню для навигации",
+                    reply_markup=self.menu.get_main_menu()
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in message handler: {e}")
             await update.message.reply_text(
-                "🤖 Используйте меню для навигации:",
+                "❌ Произошла ошибка. Попробуйте снова.",
                 reply_markup=self.menu.get_main_menu()
             )
     
@@ -997,6 +1066,14 @@ class NutritionBot:
             
             age, height, weight = int(parts[0]), int(parts[1]), float(parts[2])
             
+            # Проверяем корректность данных
+            if not (10 <= age <= 100):
+                raise ValueError("Возраст должен быть от 10 до 100 лет")
+            if not (100 <= height <= 250):
+                raise ValueError("Рост должен быть от 100 до 250 см")
+            if not (30 <= weight <= 300):
+                raise ValueError("Вес должен быть от 30 до 300 кг")
+            
             user_data = {
                 **context.user_data['plan_data'],
                 'age': age,
@@ -1005,6 +1082,8 @@ class NutritionBot:
                 'user_id': update.effective_user.id,
                 'username': update.effective_user.username
             }
+            
+            logger.info(f"🎯 Generating plan for: {user_data}")
             
             processing_msg = await update.message.reply_text("🔄 Генерируем ваш AI-план питания...")
             
@@ -1025,16 +1104,20 @@ class NutritionBot:
 
 📋 План включает:
 • 7 дней питания
-• 5 приемов пищи в день
-• Список покупок
+• 5 приемов пищи в день  
+• Сбалансированное питание
 • Рекомендации по воде
 
-Используйте меню для других функций!
+План сохранен в вашем профиле!
 """
                 await update.message.reply_text(
                     success_text,
                     reply_markup=self.menu.get_main_menu()
                 )
+                
+                # Логируем успешное создание
+                logger.info(f"✅ Plan successfully created for user {user_data['user_id']}")
+                
             else:
                 await processing_msg.delete()
                 await update.message.reply_text(
@@ -1042,32 +1125,31 @@ class NutritionBot:
                     reply_markup=self.menu.get_main_menu()
                 )
             
-            # Очищаем временные данные
+            # Очищаем временные данные ТОЛЬКО после успешного завершения
             context.user_data['awaiting_input'] = None
             context.user_data['plan_data'] = {}
             context.user_data['plan_step'] = None
             
         except ValueError as e:
-            await update.message.reply_text(
-                "❌ Ошибка в формате данных. Используйте: Возраст, Рост, Вес\nПример: 30, 180, 80"
-            )
+            error_msg = str(e)
+            if "Нужно ввести 3 числа" in error_msg:
+                await update.message.reply_text(
+                    "❌ Ошибка в формате данных. Используйте: Возраст, Рост, Вес\nПример: 30, 180, 80"
+                )
+            else:
+                await update.message.reply_text(f"❌ {error_msg}")
         except Exception as e:
-            logger.error(f"Error processing plan details: {e}")
+            logger.error(f"❌ Error processing plan details: {e}")
             await update.message.reply_text(
                 "❌ Произошла ошибка при создании плана. Попробуйте снова.",
                 reply_markup=self.menu.get_main_menu()
             )
     
     async def _generate_plan_with_gpt(self, user_data):
-        """Генерирует план питания через Yandex GPT"""
-        if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
-            logger.error("❌ YANDEX GPT KEYS NOT CONFIGURED!")
-            return self.parser._create_fallback_plan(user_data)
-        
-        prompt = self._create_gpt_prompt(user_data)
-        logger.info(f"🔮 Sending request to Yandex GPT...")
-        
+        """Генерирует план питания с помощью Yandex GPT"""
         try:
+            prompt = self._create_prompt(user_data)
+            
             headers = {
                 "Authorization": f"Api-Key {YANDEX_API_KEY}",
                 "Content-Type": "application/json"
@@ -1082,35 +1164,37 @@ class NutritionBot:
                 },
                 "messages": [
                     {
-                        "role": "system", 
-                        "text": "Ты - опытный нутрициолог. Создавай практичные, сбалансированные планы питания на 7 дней с конкретными рецептами, временем приемов пищи и списком покупок. Учитывай цели пользователя (похудение, набор массы, поддержание)."
+                        "role": "system",
+                        "text": "Ты эксперт по питанию и диетологии. Создай подробный план питания на 7 дней."
                     },
                     {
-                        "role": "user",
+                        "role": "user", 
                         "text": prompt
                     }
                 ]
             }
             
+            logger.info("🚀 Sending request to Yandex GPT...")
             response = requests.post(YANDEX_GPT_URL, headers=headers, json=data, timeout=60)
             
             if response.status_code == 200:
                 result = response.json()
                 gpt_response = result['result']['alternatives'][0]['message']['text']
-                logger.info("✅ Yandex GPT response received successfully!")
+                logger.info("✅ GPT response received successfully")
                 
+                # Парсим ответ
                 structured_plan = self.parser.parse_plan_response(gpt_response, user_data)
                 return structured_plan
             else:
-                logger.error(f"❌ Yandex GPT API error {response.status_code}")
-                return self.parser._create_fallback_plan(user_data)
+                logger.error(f"❌ GPT API error: {response.status_code} - {response.text}")
+                return None
                 
         except Exception as e:
-            logger.error(f"❌ Error calling Yandex GPT: {e}")
-            return self.parser._create_fallback_plan(user_data)
-
-    def _create_gpt_prompt(self, user_data):
-        """Создает промт для Yandex GPT"""
+            logger.error(f"❌ Error generating plan with GPT: {e}")
+            return None
+    
+    def _create_prompt(self, user_data):
+        """Создает промпт для GPT на основе данных пользователя"""
         gender = user_data['gender']
         goal = user_data['goal']
         activity = user_data['activity']
@@ -1118,108 +1202,75 @@ class NutritionBot:
         height = user_data['height']
         weight = user_data['weight']
         
-        goal_descriptions = {
-            'похудение': 'дефицит калорий для снижения веса',
-            'набор массы': 'профицит калорий для набора мышечной массы', 
-            'поддержание': 'баланс калорий для поддержания текущего веса'
-        }
-        
-        activity_descriptions = {
-            'высокая': 'регулярные интенсивные тренировки 5-7 раз в неделю',
-            'средняя': 'умеренные тренировки 3-4 раза в неделю',
-            'низкая': 'малоподвижный образ жизни, редкие тренировки'
-        }
-        
-        return f"""
-Создай подробный план питания на 7 дней (с понедельника по воскресенье) для:
+        prompt = f"""
+Создай подробный план питания на 7 дней для:
 
-ПОЛЬЗОВАТЕЛЬ:
-• Пол: {gender}
-• Возраст: {age} лет
-• Рост: {height} см
-• Вес: {weight} кг
-• Цель: {goal} ({goal_descriptions.get(goal, '')})
-• Уровень активности: {activity} ({activity_descriptions.get(activity, '')})
+Пол: {gender}
+Цель: {goal}
+Уровень активности: {activity}
+Возраст: {age} лет
+Рост: {height} см
+Вес: {weight} кг
 
-ТРЕБОВАНИЯ К ПЛАНУ:
-1. 5 приемов пищи в день: завтрак, перекус 1, обед, перекус 2, ужин
-2. Сбалансированное соотношение БЖУ
-3. Общая калорийность должна соответствовать цели "{goal}"
-4. Использование доступных сезонных продуктов
-5. Простые рецепты с временем приготовления до 30 минут
-6. Указание времени для каждого приема пищи
-7. Реалистичные порции
+Требования к плану:
+1. 7 дней (ПОНЕДЕЛЬНИК - ВОСКРЕСЕНЬЕ)
+2. 5 приемов пищи в день: ЗАВТРАК, ПЕРЕКУС 1, ОБЕД, ПЕРЕКУС 2, УЖИН
+3. Для каждого приема пищи укажи:
+   - Время приема (например, 8:00)
+   - Название блюда
+   - Калорийность в ккал
+   - Ингредиенты с количествами
+   - Простые инструкции приготовления
+   - Время приготовления
 
-ФОРМАТ ОТВЕТА:
+4. В конце предоставь:
+   - Общий список покупок на неделю
+   - Рекомендации по водному режиму
+   - Общие рекомендации по питанию
 
-ДЕНЬ 1 / ПОНЕДЕЛЬНИК
+План должен быть сбалансированным, практичным и учитывать указанную цель ({goal}).
+Используй доступные продукты, простые рецепты.
 
-ЗАВТРАК (8:00)
-Овсяная каша с фруктами - 350 ккал
-
-Ингредиенты:
-• Овсяные хлопья - 60г
-• Молоко 2.5% - 150мл
-• Банан - 1 шт
-• Мед - 1 ч.л.
-
-Приготовление:
-1. Варите овсяные хлопья 10 минут
-2. Добавьте нарезанный банан и мед
-3. Подавайте теплым
-
-Время приготовления: 15 минут
-
-[аналогично для всех приемов пищи и дней]
-
-СПИСОК ПОКУПОК НА НЕДЕЛЮ:
-[перечисли все необходимые продукты с количествами]
-
-ОБЩИЕ РЕКОМЕНДАЦИИ:
-[советы по питанию и водному режиму]
-
-ВОДНЫЙ РЕЖИМ:
-[рекомендации по потреблению воды]
+Форматируй ответ четко по дням и приемам пищи.
 """
-
+        return prompt
+    
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ошибок"""
-        logger.error(f"Exception: {context.error}")
-
-    def run_web_server(self):
-        """Запускает веб-сервер"""
-        def run_flask():
-            port = int(os.getenv('PORT', 10000))
-            app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
-        threading.Thread(target=run_flask, daemon=True).start()
-        logger.info(f"🌐 Web server started on port {os.getenv('PORT', 10000)}")
-    
-    def run_bot(self):
-        """Запускает бота"""
+        logger.error(f"❌ Exception while handling update: {context.error}")
+        
         try:
-            logger.info("🔧 Starting bot polling...")
-            self.application.run_polling(
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES
-            )
+            if update and update.effective_message:
+                await update.effective_message.reply_text(
+                    "❌ Произошла непредвиденная ошибка. Попробуйте позже.",
+                    reply_markup=self.menu.get_main_menu()
+                )
         except Exception as e:
-            logger.error(f"❌ Bot error: {e}")
-            time.sleep(30)
-            self.run_bot()
+            logger.error(f"Error in error handler: {e}")
 
-def main():
-    """Главная функция"""
-    logger.info("🚀 Starting nutrition bot services...")
-    
+# ==================== ЗАПУСК БОТА ====================
+
+def run_bot():
+    """Запускает бота"""
     try:
         bot = NutritionBot()
-        bot.run_web_server()
-        logger.info("✅ Web server started, starting bot...")
-        bot.run_bot()
+        
+        # Запуск Flask в отдельном потоке
+        def run_flask():
+            port = int(os.environ.get('PORT', 5000))
+            app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+        
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        logger.info(f"🚀 Flask server started on port {os.environ.get('PORT', 5000)}")
+        
+        # Запуск бота
+        logger.info("🤖 Starting bot polling...")
+        bot.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
     except Exception as e:
-        logger.error(f"💥 Failed to start services: {e}")
-        time.sleep(60)
-        main()
+        logger.error(f"❌ Failed to start bot: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    run_bot()
