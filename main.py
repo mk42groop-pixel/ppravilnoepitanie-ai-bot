@@ -4,8 +4,7 @@ import threading
 import time
 import sqlite3
 import json
-import aiohttp
-import asyncio
+import requests  # ЗАМЕНА aiohttp на requests
 import signal
 import atexit
 import socket
@@ -943,7 +942,7 @@ class InteractiveMenu:
         return InlineKeyboardMarkup(keyboard)
 
     def get_water_regime_keyboard(self):
-        """Клавиатура для водного режима"""
+        """Клавиатура для водный режим"""
         keyboard = [
             [InlineKeyboardButton("↩️ НАЗАД К ДНЯМ", callback_data="back_to_days")],
             [InlineKeyboardButton("🏠 ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
@@ -1354,52 +1353,52 @@ class NutritionBot:
         """Генерирует план питания через Yandex GPT"""
         if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
             logger.error("❌ YANDEX GPT KEYS NOT CONFIGURED!")
-            await asyncio.sleep(2)
             return self._generate_detailed_fallback_plan(user_data)
         
         prompt = self._create_gpt_prompt(user_data)
         logger.info(f"🔮 Sending request to Yandex GPT...")
         
         try:
-            async with aiohttp.ClientSession() as session:
-                headers = {
-                    "Authorization": f"Api-Key {YANDEX_API_KEY}",
-                    "Content-Type": "application/json"
-                }
-                
-                data = {
-                    "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt/latest",
-                    "completionOptions": {
-                        "stream": False,
-                        "temperature": 0.7,
-                        "maxTokens": 8000
+            headers = {
+                "Authorization": f"Api-Key {YANDEX_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt/latest",
+                "completionOptions": {
+                    "stream": False,
+                    "temperature": 0.7,
+                    "maxTokens": 8000
+                },
+                "messages": [
+                    {
+                        "role": "system", 
+                        "text": "Ты - профессор нутрициологии с 20-летним опытом. Создавай детальные, практичные планы питания с конкретными рецептами и временем приемов пищи. ОБЯЗАТЕЛЬНО включай подробный список покупок на неделю, который соответствует всем рецептам."
                     },
-                    "messages": [
-                        {
-                            "role": "system", 
-                            "text": "Ты - профессор нутрициологии с 20-летним опытом. Создавай детальные, практичные планы питания с конкретными рецептами и временем приемов пищи. ОБЯЗАТЕЛЬНО включай подробный список покупок на неделю, который соответствует всем рецептам."
-                        },
-                        {
-                            "role": "user",
-                            "text": prompt
-                        }
-                    ]
-                }
+                    {
+                        "role": "user",
+                        "text": prompt
+                    }
+                ]
+            }
+            
+            # СИНХРОННЫЙ ЗАПРОС вместо асинхронного
+            response = requests.post(YANDEX_GPT_URL, headers=headers, json=data, timeout=120)
+            
+            if response.status_code == 200:
+                result = response.json()
+                gpt_response = result['result']['alternatives'][0]['message']['text']
+                logger.info("✅ Yandex GPT response received successfully!")
                 
-                async with session.post(YANDEX_GPT_URL, headers=headers, json=data, timeout=120) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        gpt_response = result['result']['alternatives'][0]['message']['text']
-                        logger.info("✅ Yandex GPT response received successfully!")
-                        
-                        # Используем улучшенный парсер
-                        parser = GPTParser()
-                        structured_plan = parser.parse_plan_response(gpt_response, user_data)
-                        return structured_plan
-                    else:
-                        logger.error(f"❌ Yandex GPT API error {response.status}")
-                        return self._generate_detailed_fallback_plan(user_data)
-                        
+                # Используем улучшенный парсер
+                parser = GPTParser()
+                structured_plan = parser.parse_plan_response(gpt_response, user_data)
+                return structured_plan
+            else:
+                logger.error(f"❌ Yandex GPT API error {response.status_code}")
+                return self._generate_detailed_fallback_plan(user_data)
+                
         except Exception as e:
             logger.error(f"❌ Error calling Yandex GPT: {e}")
             return self._generate_detailed_fallback_plan(user_data)
