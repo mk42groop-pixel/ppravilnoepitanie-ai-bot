@@ -4,7 +4,7 @@ import threading
 import time
 import sqlite3
 import json
-import requests  # ЗАМЕНА aiohttp на requests
+import requests
 import signal
 import atexit
 import socket
@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+from telegram.error import TelegramError
 
 # Настройка логирования
 logging.basicConfig(
@@ -24,11 +25,8 @@ logger = logging.getLogger(__name__)
 
 # ==================== КОНФИГУРАЦИЯ ====================
 
-# ID администратора (замени на свой Telegram ID)
-ADMIN_USER_ID = 362423055  # ⚠️ ЗАМЕНИ на свой реальный ID
-
-# Настройки канала для подписки
-CHANNEL_USERNAME = "@ppsupershef"  # Username канала
+# ID администратора
+ADMIN_USER_ID = 362423055
 
 # Yandex GPT настройки
 YANDEX_API_KEY = os.getenv('YANDEX_API_KEY')
@@ -42,11 +40,9 @@ def init_database():
     conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
     cursor = conn.cursor()
     
-    # Включаем оптимизации для SQLite
     cursor.execute('PRAGMA journal_mode=WAL')
     cursor.execute('PRAGMA synchronous=NORMAL')
     cursor.execute('PRAGMA cache_size=-64000')
-    cursor.execute('PRAGMA foreign_keys=ON')
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
@@ -91,26 +87,13 @@ def init_database():
         )
     ''')
     
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS shopping_lists (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            plan_id INTEGER NOT NULL,
-            items TEXT,
-            checked_items TEXT DEFAULT '[]',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Создаем индексы для производительности
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_plans_user_id ON nutrition_plans(user_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_limits_user_id ON user_limits(user_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_checkins_user_date ON daily_checkins(user_id, date)')
     
     conn.commit()
     conn.close()
-    logger.info("Database initialized with optimizations")
+    logger.info("Database initialized")
 
 def save_user(user_data):
     """Сохраняет пользователя в БД"""
@@ -135,7 +118,6 @@ def is_admin(user_id):
 def can_make_request(user_id):
     """Проверяет, может ли пользователь сделать запрос плана"""
     try:
-        # Администратор всегда может создавать планы
         if is_admin(user_id):
             return True
             
@@ -216,68 +198,10 @@ def save_plan(user_id, plan_data):
                       (user_id, json.dumps(plan_data)))
         plan_id = cursor.lastrowid
         conn.commit()
-        
-        # Сохраняем список покупок
-        save_shopping_list(user_id, plan_id, plan_data.get('shopping_list', ''))
-        
         return plan_id
     except Exception as e:
         logger.error(f"Error saving plan: {e}")
         return None
-    finally:
-        conn.close()
-
-def save_shopping_list(user_id, plan_id, shopping_list):
-    """Сохраняет список покупок"""
-    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute('''
-            INSERT INTO shopping_lists (user_id, plan_id, items)
-            VALUES (?, ?, ?)
-        ''', (user_id, plan_id, shopping_list))
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Error saving shopping list: {e}")
-    finally:
-        conn.close()
-
-def get_shopping_list(user_id, plan_id):
-    """Получает список покупок"""
-    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute('SELECT items, checked_items FROM shopping_lists WHERE user_id = ? AND plan_id = ?', 
-                      (user_id, plan_id))
-        result = cursor.fetchone()
-        if result:
-            return {
-                'items': result[0],
-                'checked_items': json.loads(result[1]) if result[1] else []
-            }
-        return None
-    except Exception as e:
-        logger.error(f"Error getting shopping list: {e}")
-        return None
-    finally:
-        conn.close()
-
-def update_checked_items(user_id, plan_id, checked_items):
-    """Обновляет отмеченные товары"""
-    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute('''
-            UPDATE shopping_lists 
-            SET checked_items = ? 
-            WHERE user_id = ? AND plan_id = ?
-        ''', (json.dumps(checked_items), user_id, plan_id))
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Error updating checked items: {e}")
     finally:
         conn.close()
 
@@ -346,12 +270,12 @@ class GPTParser:
                     if day_data:
                         structured_plan['days'].append(day_data)
             
-            # УБЕДИТЕЛЬНАЯ СИНХРОНИЗАЦИЯ: если список покупок пустой, генерируем из ингредиентов
-            if not structured_plan['shopping_list'] or structured_plan['shopping_list'].strip() == self._generate_default_shopping_list():
-                structured_plan['shopping_list'] = self._generate_shopping_list_from_meals(structured_plan['days'])
+            # Если дней меньше 7, дополняем
+            while len(structured_plan['days']) < 7:
+                day_index = len(structured_plan['days'])
+                structured_plan['days'].append(self._create_fallback_day(day_index))
             
             self.logger.info(f"✅ Successfully parsed {len(structured_plan['days'])} days")
-            self.logger.info(f"🛒 Shopping list synchronized: {len(structured_plan['shopping_list'].split(chr(10)))} items")
             return structured_plan
             
         except Exception as e:
@@ -366,29 +290,26 @@ class GPTParser:
         if matches:
             return matches
         else:
-            return self._split_by_headers(text)
-    
-    def _split_by_headers(self, text):
-        """Альтернативный метод разбивки по заголовкам"""
-        lines = text.split('\n')
-        days = []
-        current_day = []
-        day_started = False
-        
-        for line in lines:
-            if re.match(r'.*(день|понедельник|вторник|среда|четверг|пятница|суббота|воскресенье).*', line.lower()):
-                if day_started and current_day:
-                    days.append('\n'.join(current_day))
-                    current_day = []
-                day_started = True
+            # Альтернативный метод разбивки
+            lines = text.split('\n')
+            days = []
+            current_day = []
+            day_started = False
             
-            if day_started:
-                current_day.append(line)
-        
-        if current_day:
-            days.append('\n'.join(current_day))
-        
-        return days if days else [text]
+            for line in lines:
+                if re.match(r'.*(день|понедельник|вторник|среда|четверг|пятница|суббота|воскресенье).*', line.lower()):
+                    if day_started and current_day:
+                        days.append('\n'.join(current_day))
+                        current_day = []
+                    day_started = True
+                
+                if day_started:
+                    current_day.append(line)
+            
+            if current_day:
+                days.append('\n'.join(current_day))
+            
+            return days if days else [text]
     
     def _parse_day(self, day_text, day_index):
         """Парсит данные одного дня"""
@@ -398,7 +319,6 @@ class GPTParser:
         return {
             'name': day_name,
             'meals': self._extract_meals(day_text),
-            'schedule': self._extract_daily_schedule(day_text),
             'total_calories': self._calculate_day_calories(day_text)
         }
     
@@ -418,11 +338,17 @@ class GPTParser:
             if meal_data:
                 meals.append(meal_data)
         
+        # Если приемов пищи меньше 5, дополняем
+        while len(meals) < 5:
+            meal_index = len(meals)
+            meals.append(self._create_fallback_meal(meal_types[meal_index] if meal_index < len(meal_types) else ('ПРИЕМ ПИЩИ', '🍽️')))
+        
         return meals
     
     def _extract_meal_data(self, day_text, meal_type, emoji):
         """Извлекает данные конкретного приема пищи"""
-        meal_pattern = f'{meal_type}.*?(?=\\n\\s*(?:{meal_type}|ЗАВТРАК|ОБЕД|УЖИН|ПЕРЕКУС|ДЕНЬ|$))'
+        # Ищем секцию с приемом пищи
+        meal_pattern = f'{meal_type}.*?(?=\\n\\s*(?:{"|".join([m[0] for m in [("ЗАВТРАК", ""), ("ОБЕД", ""), ("УЖИН", ""), ("ПЕРЕКУС", "")]])}|ДЕНЬ|$))'
         match = re.search(meal_pattern, day_text, re.DOTALL | re.IGNORECASE)
         
         if not match:
@@ -438,38 +364,49 @@ class GPTParser:
             'calories': self._extract_calories(meal_text),
             'ingredients': self._extract_ingredients(meal_text),
             'instructions': self._extract_instructions(meal_text),
-            'cooking_time': self._extract_cooking_time(meal_text),
-            'nutrition': self._extract_nutrition_info(meal_text)
+            'cooking_time': self._extract_cooking_time(meal_text)
         }
     
     def _extract_meal_name(self, meal_text):
         """Извлекает название блюда"""
+        # Ищем название после времени или типа приема пищи
         name_patterns = [
-            r'\d{1,2}[:.]\d{2}[\s-]*(.*?)(?=\\n|$|Ингредиенты|Приготовление)',
+            r'\d{1,2}[:.]\d{2}[\s-]*(.*?)(?=\\n|$)',
             r'(?:Завтрак|Обед|Ужин|Перекус)[\s:]*(.*?)(?=\\n|$)',
-            r'[A-ZА-Я][a-zа-я]+\s+[A-ZА-Яa-zа-я\s]+(?=\\n)'
         ]
         
         for pattern in name_patterns:
             match = re.search(pattern, meal_text, re.DOTALL | re.IGNORECASE)
             if match:
                 name = match.group(1) if match.lastindex else match.group(0)
-                return self._clean_text(name.strip())
+                cleaned_name = self._clean_text(name.strip())
+                if cleaned_name and len(cleaned_name) > 2:
+                    return cleaned_name
         
-        return "Блюдо дня"
+        return "Питательное блюдо"
     
     def _extract_meal_time(self, meal_text):
         """Извлекает время приема пищи"""
         time_pattern = r'(\d{1,2}[:.]\d{2})'
         match = re.search(time_pattern, meal_text)
-        return match.group(1).replace('.', ':') if match else "8:00"
+        if match:
+            return match.group(1).replace('.', ':')
+        
+        # Время по умолчанию в зависимости от типа приема пищи
+        time_map = {
+            'ЗАВТРАК': '8:00',
+            'ПЕРЕКУС 1': '11:00', 
+            'ОБЕД': '13:00',
+            'ПЕРЕКУС 2': '16:00',
+            'УЖИН': '19:00'
+        }
+        return time_map.get('ЗАВТРАК', '8:00')
     
     def _extract_calories(self, meal_text):
         """Извлекает калорийность"""
         calorie_patterns = [
             r'(\d+)\s*ккал',
             r'калорийность:\s*(\d+)',
-            r'калории:\s*(\d+)'
         ]
         
         for pattern in calorie_patterns:
@@ -481,6 +418,7 @@ class GPTParser:
     
     def _extract_ingredients(self, meal_text):
         """Извлекает список ингредиентов"""
+        # Ищем секцию с ингредиентами
         ingredients_section = self._find_section(meal_text, ['ингредиенты', 'состав', 'продукты'])
         
         if ingredients_section:
@@ -488,34 +426,32 @@ class GPTParser:
             ingredients = []
             for line in lines:
                 line = line.strip()
-                if line and not re.match(r'^(ингредиенты|состав|продукы)', line.lower()):
+                if line and not re.match(r'^(ингредиенты|состав|продукты)', line.lower()):
                     clean_line = re.sub(r'^[•\-*\d\.]\s*', '', line)
                     if clean_line and len(clean_line) > 3:
                         ingredients.append(f"• {clean_line}")
             
             if ingredients:
-                return '\n'.join(ingredients[:10])
+                return '\n'.join(ingredients[:8])
         
-        return self._extract_ingredients_fallback(meal_text)
+        return "• Свежие продукты по сезону\n• Специи по вкусу"
     
     def _extract_instructions(self, meal_text):
         """Извлекает инструкции приготовления"""
-        instructions_section = self._find_section(meal_text, ['приготовление', 'рецепт', 'инструкция', 'шаги'])
+        instructions_section = self._find_section(meal_text, ['приготовление', 'рецепт', 'инструкция'])
         
         if instructions_section:
             steps = self._split_into_steps(instructions_section)
             if steps:
                 return '\n'.join([f"{i+1}. {step}" for i, step in enumerate(steps)])
         
-        return self._generate_simple_instructions(meal_text)
+        return "1. Подготовьте все ингредиенты\n2. Следуйте рецепту приготовления\n3. Подавайте свежим"
     
     def _extract_cooking_time(self, meal_text):
         """Извлекает время приготовления"""
         time_patterns = [
             r'время[^\d]*(\d+)[^\d]*минут',
             r'готовить[^\d]*(\d+)[^\d]*мин',
-            r'(\d+)[^\d]*минут',
-            r'(\d+)[^\d]*мин'
         ]
         
         for pattern in time_patterns:
@@ -524,24 +460,6 @@ class GPTParser:
                 return f"{match.group(1)} минут"
         
         return "15-20 минут"
-    
-    def _extract_nutrition_info(self, meal_text):
-        """Извлекает информацию о БЖУ"""
-        nutrition = {}
-        
-        protein_match = re.search(r'бел[киа-я]*[^\d]*(\d+)[^\d]*г', meal_text, re.IGNORECASE)
-        if protein_match:
-            nutrition['protein'] = f"{protein_match.group(1)}г"
-        
-        fat_match = re.search(r'жир[ыа-я]*[^\d]*(\d+)[^\d]*г', meal_text, re.IGNORECASE)
-        if fat_match:
-            nutrition['fat'] = f"{fat_match.group(1)}г"
-        
-        carb_match = re.search(r'углевод[ыа-я]*[^\d]*(\d+)[^\d]*г', meal_text, re.IGNORECASE)
-        if carb_match:
-            nutrition['carbs'] = f"{carb_match.group(1)}г"
-        
-        return nutrition
     
     def _find_section(self, text, keywords):
         """Находит секцию по ключевым словам"""
@@ -556,158 +474,39 @@ class GPTParser:
         """Разбивает текст на шаги приготовления"""
         text = re.sub(r'^(приготовление|рецепт|инструкция)[:\s]*', '', text, flags=re.IGNORECASE)
         
-        patterns = [
-            r'\d+[\.\)]\s*(.*?)(?=\d+[\.\)]|$)',
-            r'[•\-]\s*(.*?)(?=\\n[•\-]|$)',
-            r'(?<=\\n)(.*?)(?=\\n|$)'
-        ]
+        # Ищем нумерованные шаги
+        steps = re.findall(r'\d+[\.\)]\s*(.*?)(?=\d+[\.\)]|$)', text, re.DOTALL)
+        if steps:
+            return [self._clean_text(step) for step in steps if step.strip()]
         
-        for pattern in patterns:
-            steps = re.findall(pattern, text, re.DOTALL)
-            if steps and len(steps) > 1:
-                return [self._clean_text(step) for step in steps if step.strip()]
+        # Ищем шаги с буллетами
+        steps = re.findall(r'[•\-]\s*(.*?)(?=\\n[•\-]|$)', text, re.DOTALL)
+        if steps:
+            return [self._clean_text(step) for step in steps if step.strip()]
         
+        # Разбиваем по строкам
         lines = [line.strip() for line in text.split('\n') if line.strip()]
-        return lines[:7]
-    
-    def _extract_ingredients_fallback(self, meal_text):
-        """Альтернативный метод извлечения ингредиентов"""
-        common_ingredients = [
-            'овсян', 'гречк', 'рис', 'куриц', 'рыб', 'творог', 'йогурт', 'молок',
-            'яйц', 'овощ', 'фрукт', 'орех', 'сыр', 'хлеб', 'масл', 'сметан'
-        ]
-        
-        lines = meal_text.split('\n')
-        ingredients = []
-        
-        for line in lines:
-            line_lower = line.lower()
-            if any(ingredient in line_lower for ingredient in common_ingredients):
-                clean_line = re.sub(r'^[•\-*\d\.]\s*', '', line.strip())
-                if clean_line and len(clean_line) > 5:
-                    ingredients.append(f"• {clean_line}")
-        
-        return '\n'.join(ingredients[:8]) if ingredients else "• Ингредиенты будут уточнены"
-    
-    def _generate_simple_instructions(self, meal_text):
-        """Генерирует простые инструкции на основе текста"""
-        return """1. Подготовьте все ингредиенты
-2. Следуйте стандартному приготовлению
-3. Готовьте до готовности
-4. Подавайте свежим"""
+        return lines[:5]
     
     def _extract_shopping_list(self, text):
-        """УЛУЧШЕННОЕ извлечение списка покупок"""
-        shopping_section = self._find_section(text, ['список покупок', 'покупки', 'продукты на неделю', 'шопинг-лист'])
+        """Извлечение списка покупок"""
+        shopping_section = self._find_section(text, ['список покупок', 'покупки', 'продукты на неделю'])
         
         if shopping_section:
             lines = shopping_section.split('\n')
             items = []
             for line in lines:
                 line = line.strip()
-                if line and not re.match(r'^(список покупок|покупки|продукты|шопинг-лист)', line.lower()):
+                if line and not re.match(r'^(список покупок|покупки|продукты)', line.lower()):
                     clean_line = re.sub(r'^[•\-*\d\.]\s*', '', line)
                     if clean_line and len(clean_line) > 3:
                         items.append(clean_line)
             
             if items:
-                unique_items = list(dict.fromkeys(items))  # Удаляем дубликаты
-                return '\n'.join(unique_items[:25])
+                unique_items = list(dict.fromkeys(items))
+                return '\n'.join(unique_items[:20])
         
-        # Если не нашли в отдельной секции, ищем в общем тексте
-        return self._extract_shopping_list_from_text(text)
-    
-    def _extract_shopping_list_from_text(self, text):
-        """Извлекает список покупок из общего текста"""
-        # Ищем паттерны типа "Продукты:", "Необходимо:" и т.д.
-        shopping_patterns = [
-            r'(?:продукты|покупки|необходимо|ингредиенты)[:\s]*\n((?:.*\n){5,20})',
-            r'(?:закупить|приобрести)[^.]*?:\n((?:.*\n){5,15})'
-        ]
-        
-        for pattern in shopping_patterns:
-            match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-            if match:
-                items_text = match.group(1)
-                items = []
-                for line in items_text.split('\n'):
-                    line = line.strip()
-                    if line and len(line) > 3:
-                        clean_line = re.sub(r'^[•\-*\d\.]\s*', '', line)
-                        items.append(clean_line)
-                
-                if items:
-                    return '\n'.join(items[:20])
-        
-        return ""
-    
-    def _generate_shopping_list_from_meals(self, days):
-        """ГЕНЕРИРУЕТ список покупок из ингредиентов всех блюд"""
-        self.logger.info("🛒 Generating shopping list from meal ingredients...")
-        
-        all_ingredients = []
-        
-        for day in days:
-            for meal in day.get('meals', []):
-                ingredients_text = meal.get('ingredients', '')
-                if ingredients_text:
-                    # Извлекаем ингредиенты из текста
-                    ingredients = self._parse_ingredients_from_text(ingredients_text)
-                    all_ingredients.extend(ingredients)
-        
-        # Объединяем и удаляем дубликаты
-        unique_ingredients = list(dict.fromkeys(all_ingredients))
-        
-        if unique_ingredients:
-            shopping_list = '\n'.join(unique_ingredients[:30])
-            self.logger.info(f"✅ Generated shopping list with {len(unique_ingredients)} unique items")
-            return shopping_list
-        else:
-            self.logger.warning("⚠️ Could not generate shopping list from ingredients, using fallback")
-            return self._generate_default_shopping_list()
-    
-    def _parse_ingredients_from_text(self, ingredients_text):
-        """Парсит ингредиенты из текста"""
-        lines = ingredients_text.split('\n')
-        ingredients = []
-        
-        for line in lines:
-            line = line.strip()
-            if line.startswith('•'):
-                ingredient = line[1:].strip()
-                if len(ingredient) > 3:
-                    ingredients.append(ingredient)
-        
-        return ingredients
-    
-    def _generate_default_shopping_list(self):
-        """Генерирует стандартный список покупок"""
-        return """Куриная грудка - 700г
-Филе индейки - 500г
-Белая рыба (треска, минтай) - 600г
-Говядина нежирная - 400г
-Яйца - 10 шт
-Творог 5% - 500г
-Йогурт натуральный - 400г
-Молоко 2.5% - 1 л
-Сметана 15% - 200г
-Сыр твердый - 150г
-Помидоры - 500г
-Огурцы - 500г
-Капуста белокочанная - 500г
-Морковь - 300г
-Лук репчатый - 300г
-Чеснок - 1 головка
-Зелень (петрушка, укроп) - 1 пучок
-Яблоки - 500г
-Бананы - 500г
-Апельсины - 300г
-Гречка - 300г
-Овсяные хлопья - 300г
-Рис бурый - 300г
-Хлеб ржаной - 1 буханка
-Масло оливковое - 150мл
-Масло подсолнечное - 150мл"""
+        return self._generate_default_shopping_list()
     
     def _extract_general_recommendations(self, text):
         """Извлекает общие рекомендации"""
@@ -717,11 +516,7 @@ class GPTParser:
         if water_match:
             recommendations.append(f"💧 {water_match.group(1)}")
         
-        regime_match = re.search(r'(режим.*?сна.*?\d+.*?час)', text, re.IGNORECASE)
-        if regime_match:
-            recommendations.append(f"😴 {regime_match.group(1)}")
-        
-        return '\n'.join(recommendations) if recommendations else "💡 Следуйте индивидуальным рекомендациям плана"
+        return '\n'.join(recommendations) if recommendations else "💡 Следуйте сбалансированному питанию и пейте достаточное количество воды"
     
     def _extract_water_regime(self, text):
         """Извлекает водный режим"""
@@ -738,76 +533,127 @@ class GPTParser:
         return "~1800 ккал"
     
     def _clean_text(self, text):
-        """Очищает текст от лишних пробелов и символов"""
+        """Очищает текст"""
         if not text:
             return ""
         text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r'[«»"“”]', '', text)
         return text.strip()
     
+    def _generate_default_shopping_list(self):
+        """Генерирует стандартный список покупок"""
+        return """Куриная грудка - 700г
+Филе индейки - 500г
+Белая рыба - 600г
+Говядина - 400г
+Яйца - 10 шт
+Творог 5% - 500г
+Йогурт натуральный - 400г
+Молоко - 1 л
+Сметана - 200г
+Сыр - 150г
+Помидоры - 500г
+Огурцы - 500г
+Капуста - 500г
+Морковь - 300г
+Лук - 300г
+Чеснок - 1 головка
+Зелень - 1 пучок
+Яблоки - 500г
+Бананы - 500г
+Апельсины - 300г
+Гречка - 300г
+Овсяные хлопья - 300г
+Рис - 300г
+Хлеб ржаной - 1 буханка
+Масло оливковое - 150мл"""
+    
     def _create_fallback_plan(self, user_data):
-        """Создает резервный план при ошибке парсинга"""
+        """Создает резервный план"""
         self.logger.warning("🔄 Using fallback plan")
         fallback_plan = {
-            'days': self._create_sample_days(),
+            'days': [self._create_fallback_day(i) for i in range(7)],
             'shopping_list': self._generate_default_shopping_list(),
-            'general_recommendations': "💡 Используйте свежие сезонные продукты",
-            'water_regime': "1.5-2 литра воды в день",
+            'general_recommendations': "💡 Используйте свежие сезонные продукты и пейте достаточное количество воды",
+            'water_regime': "1.5-2 литра в день",
             'user_data': user_data,
             'parsed_at': datetime.now().isoformat()
         }
-        
-        # ГАРАНТИРУЕМ синхронизацию даже в fallback-режиме
-        fallback_plan['shopping_list'] = self._generate_shopping_list_from_meals(fallback_plan['days'])
-        
         return fallback_plan
     
-    def _create_sample_days(self):
-        """Создает примерные данные дней"""
-        sample_meals = [
-            {
-                'type': 'ЗАВТРАК',
-                'emoji': '🍳',
+    def _create_fallback_day(self, day_index):
+        """Создает резервный день"""
+        day_names = ['ПОНЕДЕЛЬНИК', 'ВТОРНИК', 'СРЕДА', 'ЧЕТВЕРГ', 'ПЯТНИЦА', 'СУББОТА', 'ВОСКРЕСЕНЬЕ']
+        day_name = day_names[day_index] if day_index < len(day_names) else f"ДЕНЬ {day_index + 1}"
+        
+        return {
+            'name': day_name,
+            'meals': [self._create_fallback_meal(meal_type) for meal_type in [
+                ('ЗАВТРАК', '🍳'), ('ПЕРЕКУС 1', '🥗'), ('ОБЕД', '🍲'), 
+                ('ПЕРЕКУС 2', '🍎'), ('УЖИН', '🍛')
+            ]],
+            'total_calories': '~1800 ккал'
+        }
+    
+    def _create_fallback_meal(self, meal_type):
+        """Создает резервный прием пищи"""
+        meal_type_name, emoji = meal_type
+        
+        # Разные блюда для разных приемов пищи
+        meals_map = {
+            'ЗАВТРАК': {
                 'name': 'Овсяная каша с фруктами',
-                'time': '8:00',
-                'calories': '350 ккал',
                 'ingredients': '• Овсяные хлопья - 60г\n• Молоко - 150мл\n• Банан - 1 шт\n• Мед - 1 ч.л.',
-                'instructions': '1. Варите овсянку 10 минут\n2. Добавьте банан и мед\n3. Подавайте теплым',
-                'cooking_time': '15 минут',
-                'nutrition': {'protein': '12г', 'carbs': '60г', 'fat': '8г'}
+                'instructions': '1. Варите овсянку 10 минут\n2. Добавьте банан и мед\n3. Подавайте теплым'
             },
-            {
-                'type': 'ОБЕД',
-                'emoji': '🍲',
+            'ПЕРЕКУС 1': {
+                'name': 'Йогурт с орехами',
+                'ingredients': '• Йогурт натуральный - 150г\n• Грецкие орехи - 30г\n• Ягоды - 50г',
+                'instructions': '1. Смешайте йогурт с орехами\n2. Добавьте ягоды\n3. Подавайте свежим'
+            },
+            'ОБЕД': {
                 'name': 'Куриная грудка с гречкой',
-                'time': '13:00',
-                'calories': '450 ккал',
                 'ingredients': '• Куриная грудка - 150г\n• Гречка - 80г\n• Огурцы - 100г\n• Помидоры - 100г',
-                'instructions': '1. Отварите гречку\n2. Приготовьте куриную грудку\n3. Подавайте с овощами',
-                'cooking_time': '25 минут',
-                'nutrition': {'protein': '35г', 'carbs': '45г', 'fat': '10г'}
+                'instructions': '1. Отварите гречку\n2. Приготовьте куриную грудку\n3. Подавайте с овощами'
+            },
+            'ПЕРЕКУС 2': {
+                'name': 'Фруктовый салат',
+                'ingredients': '• Яблоко - 1 шт\n• Банан - 1 шт\n• Апельсин - 1 шт\n• Йогурт - 50г',
+                'instructions': '1. Нарежьте фрукты\n2. Заправьте йогуртом\n3. Подавайте свежим'
+            },
+            'УЖИН': {
+                'name': 'Рыба с овощами',
+                'ingredients': '• Белая рыба - 200г\n• Брокколи - 150г\n• Морковь - 100г\n• Лук - 50г',
+                'instructions': '1. Запеките рыбу с овощами\n2. Приправьте специями\n3. Подавайте горячим'
             }
-        ]
+        }
         
-        days = []
-        for i in range(7):
-            day_meals = []
-            for meal in sample_meals:
-                # Немного варьируем ингредиенты для разных дней
-                varied_meal = meal.copy()
-                if i % 2 == 0:
-                    varied_meal['ingredients'] = varied_meal['ingredients'].replace('Овсяные хлопья', 'Гречневые хлопья')
-                if i % 3 == 0:
-                    varied_meal['ingredients'] = varied_meal['ingredients'].replace('Куриная грудка', 'Филе индейки')
-                day_meals.append(varied_meal)
-            
-            days.append({
-                'name': f'ДЕНЬ {i+1}', 
-                'meals': day_meals,
-                'total_calories': '~1800 ккал'
-            })
+        meal_data = meals_map.get(meal_type_name, {
+            'name': 'Сбалансированное блюдо',
+            'ingredients': '• Свежие продукты\n• Специи по вкусу',
+            'instructions': '1. Подготовьте ингредиенты\n2. Приготовьте по рецепту\n3. Подавайте свежим'
+        })
         
-        return days
+        return {
+            'type': meal_type_name,
+            'emoji': emoji,
+            'name': meal_data['name'],
+            'time': self._get_default_meal_time(meal_type_name),
+            'calories': '350-450 ккал',
+            'ingredients': meal_data['ingredients'],
+            'instructions': meal_data['instructions'],
+            'cooking_time': '15-25 минут'
+        }
+    
+    def _get_default_meal_time(self, meal_type):
+        """Возвращает время по умолчанию для приема пищи"""
+        time_map = {
+            'ЗАВТРАК': '8:00',
+            'ПЕРЕКУС 1': '11:00',
+            'ОБЕД': '13:00',
+            'ПЕРЕКУС 2': '16:00',
+            'УЖИН': '19:00'
+        }
+        return time_map.get(meal_type, '12:00')
 
 # ==================== ИНТЕРАКТИВНЫЕ МЕНЮ ====================
 
@@ -851,104 +697,6 @@ class InteractiveMenu:
         
         return InlineKeyboardMarkup(keyboard)
 
-    def get_checkin_options(self, step=1):
-        """Опции для чек-ина"""
-        if step == 1:  # Самочувствие
-            keyboard = []
-            for i in range(0, 10, 5):
-                row = []
-                for j in range(1, 6):
-                    num = i + j
-                    row.append(InlineKeyboardButton(str(num), callback_data=f"wellbeing_{num}"))
-                keyboard.append(row)
-            keyboard.append([InlineKeyboardButton("↩️ НАЗАД", callback_data="back_to_main")])
-            
-        elif step == 2:  # Сон
-            keyboard = []
-            for i in range(0, 10, 5):
-                row = []
-                for j in range(1, 6):
-                    num = i + j
-                    row.append(InlineKeyboardButton(str(num), callback_data=f"sleep_{num}"))
-                keyboard.append(row)
-            keyboard.append([InlineKeyboardButton("↩️ НАЗАД", callback_data="back_to_wellbeing")])
-        
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_days_keyboard(self):
-        """Клавиатура для выбора дней + список покупок"""
-        keyboard = []
-        
-        # Первые 6 дней в 2 ряда по 3 кнопки
-        for i in range(0, 6, 3):
-            row = []
-            for j in range(3):
-                if i + j < len(self.days):
-                    row.append(InlineKeyboardButton(
-                        self.days[i + j], 
-                        callback_data=f"day_{i+j}"
-                    ))
-            keyboard.append(row)
-        
-        # Последний день и список покупок в одном ряду
-        keyboard.append([
-            InlineKeyboardButton(self.days[6], callback_data="day_6"),
-            InlineKeyboardButton("🛒 СПИСОК ПОКУПОК", callback_data="shopping_list")
-        ])
-        
-        keyboard.append([InlineKeyboardButton("💧 ВОДНЫЙ РЕЖИМ", callback_data="water_regime")])
-        keyboard.append([InlineKeyboardButton("🏠 ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")])
-        
-        return InlineKeyboardMarkup(keyboard)
-    
-    def get_meals_keyboard(self, day_index):
-        """Клавиатура для выбора приемов пищи"""
-        keyboard = []
-        emojis = ['🍳', '🥗', '🍲', '🍎', '🍛']
-        
-        for i, meal in enumerate(self.meals):
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{emojis[i]} {meal}", 
-                    callback_data=f"meal_{day_index}_{i}"
-                )
-            ])
-        
-        keyboard.append([InlineKeyboardButton("↩️ НАЗАД К ДНЯМ", callback_data="back_to_days")])
-        keyboard.append([InlineKeyboardButton("🏠 ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")])
-        
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_shopping_list_keyboard(self, checked_count, total_count):
-        """Клавиатура для списка покупок"""
-        progress = f" ({checked_count}/{total_count})" if total_count > 0 else ""
-        
-        keyboard = [
-            [InlineKeyboardButton(f"✅ ОЧИСТИТЬ ОТМЕТКИ{progress}", callback_data="clear_checked")],
-            [InlineKeyboardButton("📋 СОХРАНИТЬ СПИСОК", callback_data="save_shopping_list")],
-            [InlineKeyboardButton("↩️ НАЗАД К ДНЯМ", callback_data="back_to_days")],
-            [InlineKeyboardButton("🏠 ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_item_toggle_keyboard(self, item_index, is_checked):
-        """Клавиатура для переключения отметки товара"""
-        action = "uncheck" if is_checked else "check"
-        keyboard = [
-            [InlineKeyboardButton("✅ ОТМЕТИТЬ" if not is_checked else "❌ СНЯТЬ ОТМЕТКУ", 
-                                callback_data=f"toggle_{action}_{item_index}")],
-            [InlineKeyboardButton("↩️ НАЗАД К СПИСКУ", callback_data="back_to_shopping_list")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_water_regime_keyboard(self):
-        """Клавиатура для водный режим"""
-        keyboard = [
-            [InlineKeyboardButton("↩️ НАЗАД К ДНЯМ", callback_data="back_to_days")],
-            [InlineKeyboardButton("🏠 ГЛАВНОЕ МЕНЮ", callback_data="back_to_main")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-
 # ==================== FLASK APP ====================
 
 app = Flask(__name__)
@@ -964,12 +712,12 @@ def home():
 
 @app.route('/health')
 def health_check():
-    return {
+    return jsonify({
         "status": "healthy", 
         "service": "nutrition-bot",
         "timestamp": datetime.now().isoformat(),
-        "version": "6.0"
-    }
+        "version": "1.0"
+    })
 
 # ==================== ОСНОВНОЙ КЛАСС БОТА ====================
 
@@ -977,7 +725,7 @@ class NutritionBot:
     def __init__(self):
         self.bot_token = os.getenv('BOT_TOKEN')
         if not self.bot_token:
-            logger.error("❌ BOT_TOKEN not found in environment variables")
+            logger.error("❌ BOT_TOKEN not found")
             raise ValueError("BOT_TOKEN is required")
             
         init_database()
@@ -985,6 +733,7 @@ class NutritionBot:
         try:
             self.application = Application.builder().token(self.bot_token).build()
             self.menu = InteractiveMenu()
+            self.parser = GPTParser()
             self._setup_handlers()
             
             logger.info("✅ Bot initialized successfully")
@@ -1057,6 +806,10 @@ class NutritionBot:
             # Навигация
             elif data == "back_to_main":
                 await self._show_main_menu(query)
+            elif data == "back_to_gender":
+                await self._handle_create_plan(query, context)
+            elif data == "back_to_goal":
+                await self._handle_gender_back(query, context)
             
             # Ввод данных плана
             elif data.startswith("gender_"):
@@ -1065,16 +818,6 @@ class NutritionBot:
                 await self._handle_goal(query, context, data)
             elif data.startswith("activity_"):
                 await self._handle_activity(query, context, data)
-            elif data in ["back_to_gender", "back_to_goal"]:
-                await self._handle_back_navigation(query, context, data)
-            
-            # Чек-ин
-            elif data.startswith("wellbeing_"):
-                await self._handle_wellbeing(query, context, data)
-            elif data.startswith("sleep_"):
-                await self._handle_sleep(query, context, data)
-            elif data == "back_to_wellbeing":
-                await self._handle_checkin(query, context)
                 
         except Exception as e:
             logger.error(f"Error in callback handler: {e}")
@@ -1086,8 +829,6 @@ class NutritionBot:
             "🤖 ГЛАВНОЕ МЕНЮ\n\nВыберите действие:",
             reply_markup=self.menu.get_main_menu()
         )
-    
-    # ==================== СОЗДАНИЕ ПЛАНА ====================
     
     async def _handle_create_plan(self, query, context):
         """Обработчик создания плана"""
@@ -1101,7 +842,10 @@ class NutritionBot:
             )
             return
         
+        # Инициализируем данные плана
         context.user_data['plan_data'] = {}
+        context.user_data['plan_step'] = 1
+        
         await query.edit_message_text(
             "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n1️⃣ Выберите ваш пол:",
             reply_markup=self.menu.get_plan_data_input(step=1)
@@ -1109,98 +853,84 @@ class NutritionBot:
     
     async def _handle_gender(self, query, context, data):
         """Обработчик выбора пола"""
-        gender = 'Мужчина' if data == 'gender_male' else 'Женщина'
-        context.user_data['plan_data']['gender'] = gender
-        
+        try:
+            gender = 'Мужчина' if data == 'gender_male' else 'Женщина'
+            context.user_data['plan_data']['gender'] = gender
+            context.user_data['plan_step'] = 2
+            
+            await query.edit_message_text(
+                f"✅ Пол: {gender}\n\n2️⃣ Выберите вашу цель:",
+                reply_markup=self.menu.get_plan_data_input(step=2)
+            )
+        except Exception as e:
+            logger.error(f"Error in gender handler: {e}")
+            await query.edit_message_text("❌ Ошибка при выборе пола. Попробуйте снова.", reply_markup=self.menu.get_main_menu())
+    
+    async def _handle_gender_back(self, query, context):
+        """Назад к выбору пола"""
+        context.user_data['plan_step'] = 1
         await query.edit_message_text(
-            f"✅ Пол: {gender}\n\n2️⃣ Выберите вашу цель:",
-            reply_markup=self.menu.get_plan_data_input(step=2)
+            "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n1️⃣ Выберите ваш пол:",
+            reply_markup=self.menu.get_plan_data_input(step=1)
         )
     
     async def _handle_goal(self, query, context, data):
         """Обработчик выбора цели"""
-        goal_map = {'weight_loss': 'похудение', 'mass': 'набор массы', 'maintain': 'поддержание'}
-        goal = goal_map[data.split('_')[1]]
-        context.user_data['plan_data']['goal'] = goal
-        
-        await query.edit_message_text(
-            f"✅ Пол: {context.user_data['plan_data']['gender']}\n"
-            f"✅ Цель: {goal}\n\n"
-            "3️⃣ Выберите уровень активности:",
-            reply_markup=self.menu.get_plan_data_input(step=3)
-        )
+        try:
+            goal_map = {
+                'weight_loss': 'похудение', 
+                'mass': 'набор массы', 
+                'maintain': 'поддержание'
+            }
+            goal = goal_map[data.split('_')[1]]
+            context.user_data['plan_data']['goal'] = goal
+            context.user_data['plan_step'] = 3
+            
+            await query.edit_message_text(
+                f"✅ Пол: {context.user_data['plan_data']['gender']}\n"
+                f"✅ Цель: {goal}\n\n"
+                "3️⃣ Выберите уровень активности:",
+                reply_markup=self.menu.get_plan_data_input(step=3)
+            )
+        except Exception as e:
+            logger.error(f"Error in goal handler: {e}")
+            await query.edit_message_text("❌ Ошибка при выборе цели. Попробуйте снова.", reply_markup=self.menu.get_main_menu())
     
     async def _handle_activity(self, query, context, data):
         """Обработчик выбора активности"""
-        activity_map = {'high': 'высокая', 'medium': 'средняя', 'low': 'низкая'}
-        activity = activity_map[data.split('_')[1]]
-        context.user_data['plan_data']['activity'] = activity
-        
-        context.user_data['awaiting_input'] = 'plan_details'
-        await query.edit_message_text(
-            f"✅ Пол: {context.user_data['plan_data']['gender']}\n"
-            f"✅ Цель: {context.user_data['plan_data']['goal']}\n"
-            f"✅ Активность: {activity}\n\n"
-            "4️⃣ Введите через запятую:\n"
-            "• Возраст (лет)\n• Рост (см)\n• Вес (кг)\n\n"
-            "📝 Пример: 30, 180, 80\n\n"
-            "Или нажмите назад для изменения данных:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_to_goal")]
-            ])
-        )
-    
-    async def _handle_back_navigation(self, query, context, data):
-        """Обработчик навигации назад"""
-        if data == "back_to_gender":
+        try:
+            activity_map = {
+                'high': 'высокая', 
+                'medium': 'средняя', 
+                'low': 'низкая'
+            }
+            activity = activity_map[data.split('_')[1]]
+            context.user_data['plan_data']['activity'] = activity
+            context.user_data['plan_step'] = 4
+            context.user_data['awaiting_input'] = 'plan_details'
+            
             await query.edit_message_text(
-                "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n1️⃣ Выберите ваш пол:",
-                reply_markup=self.menu.get_plan_data_input(step=1)
+                f"✅ Пол: {context.user_data['plan_data']['gender']}\n"
+                f"✅ Цель: {context.user_data['plan_data']['goal']}\n"
+                f"✅ Активность: {activity}\n\n"
+                "4️⃣ Введите через запятую:\n"
+                "• Возраст (лет)\n• Рост (см)\n• Вес (кг)\n\n"
+                "📝 Пример: 30, 180, 80\n\n"
+                "Или нажмите назад для изменения данных:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_to_goal")]
+                ])
             )
-        elif data == "back_to_goal":
-            await query.edit_message_text(
-                f"✅ Пол: {context.user_data['plan_data']['gender']}\n\n2️⃣ Выберите вашу цель:",
-                reply_markup=self.menu.get_plan_data_input(step=2)
-            )
-    
-    # ==================== ЧЕК-ИН ====================
+        except Exception as e:
+            logger.error(f"Error in activity handler: {e}")
+            await query.edit_message_text("❌ Ошибка при выборе активности. Попробуйте снова.", reply_markup=self.menu.get_main_menu())
     
     async def _handle_checkin(self, query, context):
         """Обработчик чек-ина"""
-        context.user_data['checkin_data'] = {}
         await query.edit_message_text(
-            "📈 ЕЖЕДНЕВНЫЙ ЧЕК-ИН\n\n1️⃣ Оцените ваше самочувствие (1-10):",
-            reply_markup=self.menu.get_checkin_options(step=1)
+            "📈 Чек-ин временно недоступен\nИспользуйте создание плана питания",
+            reply_markup=self.menu.get_main_menu()
         )
-    
-    async def _handle_wellbeing(self, query, context, data):
-        """Обработчик выбора самочувствия"""
-        wellbeing = int(data.split('_')[1])
-        context.user_data['checkin_data']['wellbeing'] = wellbeing
-        
-        await query.edit_message_text(
-            f"✅ Самочувствие: {wellbeing}/10\n\n2️⃣ Оцените качество сна (1-10):",
-            reply_markup=self.menu.get_checkin_options(step=2)
-        )
-    
-    async def _handle_sleep(self, query, context, data):
-        """Обработчик выбора качества сна"""
-        sleep = int(data.split('_')[1])
-        context.user_data['checkin_data']['sleep'] = sleep
-        
-        context.user_data['awaiting_input'] = 'checkin_details'
-        await query.edit_message_text(
-            f"✅ Самочувствие: {context.user_data['checkin_data']['wellbeing']}/10\n"
-            f"✅ Сон: {sleep}/10\n\n"
-            "3️⃣ Введите через запятую:\n"
-            "• Вес (кг)\n• Объем талии (см)\n\n"
-            "📝 Пример: 70.5, 85",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_to_wellbeing")]
-            ])
-        )
-    
-    # ==================== СТАТИСТИКА И ПОМОЩЬ ====================
     
     async def _handle_stats(self, query, context):
         """Обработчик статистики"""
@@ -1245,8 +975,6 @@ class NutritionBot:
             reply_markup=self.menu.get_main_menu()
         )
     
-    # ==================== ОБРАБОТКА СООБЩЕНИЙ ====================
-    
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик текстовых сообщений"""
         user_id = update.effective_user.id
@@ -1254,8 +982,6 @@ class NutritionBot:
         
         if context.user_data.get('awaiting_input') == 'plan_details':
             await self._process_plan_details(update, context, text)
-        elif context.user_data.get('awaiting_input') == 'checkin_details':
-            await self._process_checkin_details(update, context, text)
         else:
             await update.message.reply_text(
                 "🤖 Используйте меню для навигации:",
@@ -1284,76 +1010,59 @@ class NutritionBot:
             
             # Генерируем план
             plan_data = await self._generate_plan_with_gpt(user_data)
-            plan_id = save_plan(user_data['user_id'], plan_data)
-            update_user_limit(user_data['user_id'])
+            if plan_data:
+                plan_id = save_plan(user_data['user_id'], plan_data)
+                update_user_limit(user_data['user_id'])
+                
+                await processing_msg.delete()
+                
+                success_text = f"""
+🎉 ВАШ ПЛАН ПИТАНИЯ ГОТОВ!
+
+👤 Данные: {user_data['gender']}, {age} лет, {height} см, {weight} кг
+🎯 Цель: {user_data['goal']}
+🏃 Активность: {user_data['activity']}
+
+📋 План включает:
+• 7 дней питания
+• 5 приемов пищи в день
+• Список покупок
+• Рекомендации по воде
+
+Используйте меню для других функций!
+"""
+                await update.message.reply_text(
+                    success_text,
+                    reply_markup=self.menu.get_main_menu()
+                )
+            else:
+                await processing_msg.delete()
+                await update.message.reply_text(
+                    "❌ Не удалось сгенерировать план. Попробуйте позже.",
+                    reply_markup=self.menu.get_main_menu()
+                )
             
-            await processing_msg.delete()
-            
-            await update.message.reply_text(
-                "🎉 ВАШ ПЛАН ПИТАНИЯ ГОТОВ!\n\n"
-                "📋 Используйте меню для навигации:",
-                reply_markup=self.menu.get_main_menu()
-            )
-            
+            # Очищаем временные данные
             context.user_data['awaiting_input'] = None
+            context.user_data['plan_data'] = {}
+            context.user_data['plan_step'] = None
             
-        except Exception as e:
+        except ValueError as e:
             await update.message.reply_text(
                 "❌ Ошибка в формате данных. Используйте: Возраст, Рост, Вес\nПример: 30, 180, 80"
             )
-    
-    async def _process_checkin_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-        """Обрабатывает детали чек-ина"""
-        try:
-            parts = [part.strip() for part in text.split(',')]
-            if len(parts) != 2:
-                raise ValueError("Нужно ввести 2 числа через запятую")
-            
-            weight, waist = float(parts[0]), int(parts[1])
-            wellbeing = context.user_data['checkin_data']['wellbeing']
-            sleep = context.user_data['checkin_data']['sleep']
-            
-            save_checkin(update.effective_user.id, weight, waist, wellbeing, sleep)
-            
-            feedback = self._analyze_checkin(wellbeing, sleep)
+        except Exception as e:
+            logger.error(f"Error processing plan details: {e}")
             await update.message.reply_text(
-                f"✅ Данные сохранены!\n\n{feedback}",
+                "❌ Произошла ошибка при создании плана. Попробуйте снова.",
                 reply_markup=self.menu.get_main_menu()
             )
-            
-            context.user_data['awaiting_input'] = None
-            
-        except Exception as e:
-            await update.message.reply_text(
-                "❌ Ошибка в формате данных. Используйте: Вес, Талия\nПример: 70.5, 85"
-            )
-    
-    def _analyze_checkin(self, wellbeing, sleep):
-        """Анализирует данные чек-ина"""
-        feedback = []
-        if wellbeing >= 8: 
-            feedback.append("🎉 Отличное самочувствие!")
-        elif wellbeing >= 6: 
-            feedback.append("👍 Хорошее состояние")
-        else: 
-            feedback.append("💤 Обратите внимание на восстановление")
-        
-        if sleep >= 8: 
-            feedback.append("😴 Качество сна на высоте!")
-        elif sleep >= 6: 
-            feedback.append("🛌 Сон в норме")
-        else: 
-            feedback.append("🌙 Старайтесь спать 7-8 часов")
-        
-        return "\n".join(feedback)
-    
-    # ==================== YANDEX GPT ====================
     
     async def _generate_plan_with_gpt(self, user_data):
         """Генерирует план питания через Yandex GPT"""
         if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
             logger.error("❌ YANDEX GPT KEYS NOT CONFIGURED!")
-            return self._generate_detailed_fallback_plan(user_data)
+            return self.parser._create_fallback_plan(user_data)
         
         prompt = self._create_gpt_prompt(user_data)
         logger.info(f"🔮 Sending request to Yandex GPT...")
@@ -1369,12 +1078,12 @@ class NutritionBot:
                 "completionOptions": {
                     "stream": False,
                     "temperature": 0.7,
-                    "maxTokens": 8000
+                    "maxTokens": 4000
                 },
                 "messages": [
                     {
                         "role": "system", 
-                        "text": "Ты - профессор нутрициологии с 20-летним опытом. Создавай детальные, практичные планы питания с конкретными рецептами и временем приемов пищи. ОБЯЗАТЕЛЬНО включай подробный список покупок на неделю, который соответствует всем рецептам."
+                        "text": "Ты - опытный нутрициолог. Создавай практичные, сбалансированные планы питания на 7 дней с конкретными рецептами, временем приемов пищи и списком покупок. Учитывай цели пользователя (похудение, набор массы, поддержание)."
                     },
                     {
                         "role": "user",
@@ -1383,25 +1092,22 @@ class NutritionBot:
                 ]
             }
             
-            # СИНХРОННЫЙ ЗАПРОС вместо асинхронного
-            response = requests.post(YANDEX_GPT_URL, headers=headers, json=data, timeout=120)
+            response = requests.post(YANDEX_GPT_URL, headers=headers, json=data, timeout=60)
             
             if response.status_code == 200:
                 result = response.json()
                 gpt_response = result['result']['alternatives'][0]['message']['text']
                 logger.info("✅ Yandex GPT response received successfully!")
                 
-                # Используем улучшенный парсер
-                parser = GPTParser()
-                structured_plan = parser.parse_plan_response(gpt_response, user_data)
+                structured_plan = self.parser.parse_plan_response(gpt_response, user_data)
                 return structured_plan
             else:
                 logger.error(f"❌ Yandex GPT API error {response.status_code}")
-                return self._generate_detailed_fallback_plan(user_data)
+                return self.parser._create_fallback_plan(user_data)
                 
         except Exception as e:
             logger.error(f"❌ Error calling Yandex GPT: {e}")
-            return self._generate_detailed_fallback_plan(user_data)
+            return self.parser._create_fallback_plan(user_data)
 
     def _create_gpt_prompt(self, user_data):
         """Создает промт для Yandex GPT"""
@@ -1412,74 +1118,74 @@ class NutritionBot:
         height = user_data['height']
         weight = user_data['weight']
         
+        goal_descriptions = {
+            'похудение': 'дефицит калорий для снижения веса',
+            'набор массы': 'профицит калорий для набора мышечной массы', 
+            'поддержание': 'баланс калорий для поддержания текущего веса'
+        }
+        
+        activity_descriptions = {
+            'высокая': 'регулярные интенсивные тренировки 5-7 раз в неделю',
+            'средняя': 'умеренные тренировки 3-4 раза в неделю',
+            'низкая': 'малоподвижный образ жизни, редкие тренировки'
+        }
+        
         return f"""
-Создай персонализированный план питания на 7 дней с учетом:
+Создай подробный план питания на 7 дней (с понедельника по воскресенье) для:
 
-👤 ДАННЫЕ ПОЛЬЗОВАТЕЛЯ:
+ПОЛЬЗОВАТЕЛЬ:
 • Пол: {gender}
 • Возраст: {age} лет
 • Рост: {height} см
 • Вес: {weight} кг
-• Цель: {goal}
-• Уровень активности: {activity}
+• Цель: {goal} ({goal_descriptions.get(goal, '')})
+• Уровень активности: {activity} ({activity_descriptions.get(activity, '')})
 
-🎯 ТРЕБОВАНИЯ К ПЛАНУ:
-• 5 приемов пищи в день (завтрак, перекус 1, обед, перекус 2, ужин)
-• Сбалансированное соотношение БЖУ
-• Общая калорийность соответствует цели "{goal}"
-• Использование свежих сезонных продуктов
-• Простые рецепты с доступными ингредиентами
-• Время приготовления не более 30 минут
+ТРЕБОВАНИЯ К ПЛАНУ:
+1. 5 приемов пищи в день: завтрак, перекус 1, обед, перекус 2, ужин
+2. Сбалансированное соотношение БЖУ
+3. Общая калорийность должна соответствовать цели "{goal}"
+4. Использование доступных сезонных продуктов
+5. Простые рецепты с временем приготовления до 30 минут
+6. Указание времени для каждого приема пищи
+7. Реалистичные порции
 
-📋 ФОРМАТ ОТВЕТА:
+ФОРМАТ ОТВЕТА:
 
 ДЕНЬ 1 / ПОНЕДЕЛЬНИК
 
 ЗАВТРАК (8:00)
-[Название блюда] - [калорийность] ккал
+Овсяная каша с фруктами - 350 ккал
 
 Ингредиенты:
-• [ингредиент 1] - [количество]
-• [ингредиент 2] - [количество]
+• Овсяные хлопья - 60г
+• Молоко 2.5% - 150мл
+• Банан - 1 шт
+• Мед - 1 ч.л.
 
 Приготовление:
-1. [шаг 1]
-2. [шаг 2]
+1. Варите овсяные хлопья 10 минут
+2. Добавьте нарезанный банан и мед
+3. Подавайте теплым
 
-ПЕРЕКУС 1 (11:00)
-[аналогично...]
+Время приготовления: 15 минут
 
-ОБЕД (13:00)
-[аналогично...]
+[аналогично для всех приемов пищи и дней]
 
-ПЕРЕКУС 2 (16:00)  
-[аналогично...]
+СПИСОК ПОКУПОК НА НЕДЕЛЮ:
+[перечисли все необходимые продукты с количествами]
 
-УЖИН (19:00)
-[аналогично...]
+ОБЩИЕ РЕКОМЕНДАЦИИ:
+[советы по питанию и водному режиму]
 
-[Аналогично для всех 7 дней]
-
-🛒 СПИСОК ПОКУПОК НА НЕДЕЛЮ:
-[ТОЧНОЕ перечисление всех необходимых продуктов из рецептов с количествами]
-
-💡 ОБЩИЕ РЕКОМЕНДАЦИИ:
-[советы по питанию, водному режиму, распорядку дня]
-
-💧 ВОДНЫЙ РЕЖИМ:
+ВОДНЫЙ РЕЖИМ:
 [рекомендации по потреблению воды]
-
-ВАЖНО: Список покупок должен ТОЧНО соответствовать ингредиентам из всех рецептов недели!
 """
-    def _generate_detailed_fallback_plan(self, user_data):
-        """Резервный план"""
-        parser = GPTParser()
-        return parser._create_fallback_plan(user_data)
-    
+
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ошибок"""
         logger.error(f"Exception: {context.error}")
-    
+
     def run_web_server(self):
         """Запускает веб-сервер"""
         def run_flask():
@@ -1488,27 +1194,18 @@ class NutritionBot:
         threading.Thread(target=run_flask, daemon=True).start()
         logger.info(f"🌐 Web server started on port {os.getenv('PORT', 10000)}")
     
-    def run_bot(self, retry_count=0):
+    def run_bot(self):
         """Запускает бота"""
-        MAX_RETRIES = 2
-        
         try:
             logger.info("🔧 Starting bot polling...")
             self.application.run_polling(
                 drop_pending_updates=True,
-                allowed_updates=['message', 'callback_query']
+                allowed_updates=Update.ALL_TYPES
             )
         except Exception as e:
-            if "Conflict" in str(e):
-                logger.error("💥 CONFLICT: Another bot instance is running. Exiting.")
-                sys.exit(1)
-            elif retry_count < MAX_RETRIES:
-                logger.error(f"❌ Bot error ({retry_count + 1}/{MAX_RETRIES}): {e}")
-                time.sleep(30)
-                self.run_bot(retry_count + 1)
-            else:
-                logger.error(f"💥 Max retries reached. Exiting.")
-                sys.exit(1)
+            logger.error(f"❌ Bot error: {e}")
+            time.sleep(30)
+            self.run_bot()
 
 def main():
     """Главная функция"""
@@ -1517,11 +1214,12 @@ def main():
     try:
         bot = NutritionBot()
         bot.run_web_server()
-        time.sleep(5)
+        logger.info("✅ Web server started, starting bot...")
         bot.run_bot()
     except Exception as e:
         logger.error(f"💥 Failed to start services: {e}")
-        sys.exit(1)
+        time.sleep(60)
+        main()
 
 if __name__ == "__main__":
     main()
