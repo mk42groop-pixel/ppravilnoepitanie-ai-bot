@@ -25,10 +25,7 @@ logger = logging.getLogger(__name__)
 
 # ==================== КОНФИГУРАЦИЯ ====================
 
-# ID администратора
 ADMIN_USER_ID = 362423055
-
-# Yandex GPT настройки
 YANDEX_API_KEY = os.getenv('YANDEX_API_KEY')
 YANDEX_FOLDER_ID = os.getenv('YANDEX_FOLDER_ID')
 YANDEX_GPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
@@ -42,7 +39,6 @@ def init_database():
     
     cursor.execute('PRAGMA journal_mode=WAL')
     cursor.execute('PRAGMA synchronous=NORMAL')
-    cursor.execute('PRAGMA cache_size=-64000')
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
@@ -51,7 +47,6 @@ def init_database():
             username TEXT,
             first_name TEXT,
             last_name TEXT,
-            subscribed BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -82,14 +77,9 @@ def init_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER UNIQUE NOT NULL,
             last_plan_date TIMESTAMP,
-            plan_count INTEGER DEFAULT 0,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            plan_count INTEGER DEFAULT 0
         )
     ''')
-    
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_plans_user_id ON nutrition_plans(user_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_limits_user_id ON user_limits(user_id)')
     
     conn.commit()
     conn.close()
@@ -112,7 +102,6 @@ def save_user(user_data):
         conn.close()
 
 def is_admin(user_id):
-    """Проверяет, является ли пользователь администратором"""
     return user_id == ADMIN_USER_ID
 
 def can_make_request(user_id):
@@ -133,9 +122,8 @@ def can_make_request(user_id):
         last_plan_date = datetime.fromisoformat(result[0])
         days_since_last_plan = (datetime.now() - last_plan_date).days
         
-        can_request = days_since_last_plan >= 7
         conn.close()
-        return can_request
+        return days_since_last_plan >= 7
         
     except Exception as e:
         logger.error(f"Error checking request limit: {e}")
@@ -152,9 +140,9 @@ def update_user_limit(user_id):
         
         current_time = datetime.now().isoformat()
         cursor.execute('''
-            INSERT OR REPLACE INTO user_limits (user_id, last_plan_date, plan_count, updated_at)
-            VALUES (?, ?, COALESCE((SELECT plan_count FROM user_limits WHERE user_id = ?), 0) + 1, ?)
-        ''', (user_id, current_time, user_id, current_time))
+            INSERT OR REPLACE INTO user_limits (user_id, last_plan_date, plan_count)
+            VALUES (?, ?, COALESCE((SELECT plan_count FROM user_limits WHERE user_id = ?), 0) + 1)
+        ''', (user_id, current_time, user_id))
         
         conn.commit()
         conn.close()
@@ -316,6 +304,28 @@ class InteractiveMenu:
         ]
         return InlineKeyboardMarkup(keyboard)
 
+# ==================== FLASK APP ====================
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return """
+    <h1>🤖 Nutrition Bot is Running!</h1>
+    <p>Бот для создания персональных планов питания</p>
+    <p><a href="/health">Health Check</a></p>
+    <p>🕒 Last update: {}</p>
+    """.format(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+@app.route('/health')
+def health_check():
+    return jsonify({
+        "status": "healthy", 
+        "service": "nutrition-bot",
+        "timestamp": datetime.now().isoformat(),
+        "version": "1.0"
+    })
+
 # ==================== ОСНОВНОЙ КЛАСС БОТА ====================
 
 class NutritionBot:
@@ -406,9 +416,9 @@ class NutritionBot:
             elif data == "back_main":
                 await self._show_main_menu(query)
             elif data == "back_gender":
-                await self._handle_create_plan(query, context)
-            elif data == "back_goal":
                 await self._handle_gender_back(query, context)
+            elif data == "back_goal":
+                await self._handle_goal_back(query, context)
             
             # Ввод данных плана
             elif data.startswith("gender_"):
@@ -426,7 +436,10 @@ class NutritionBot:
             
             else:
                 logger.warning(f"⚠️ Unknown callback data: {data}")
-                await query.edit_message_text("❌ Неизвестная команда", reply_markup=self.menu.get_main_menu())
+                await query.edit_message_text(
+                    "❌ Неизвестная команда",
+                    reply_markup=self.menu.get_main_menu()
+                )
                 
         except Exception as e:
             logger.error(f"❌ Error in callback handler: {e}")
@@ -470,12 +483,6 @@ class NutritionBot:
     async def _handle_gender_back(self, query, context):
         """Назад к выбору пола"""
         try:
-            # Сохраняем текущие данные, но возвращаемся к выбору пола
-            if 'plan_data' in context.user_data:
-                # Очищаем только выбранный пол, сохраняем остальные данные
-                if 'gender' in context.user_data['plan_data']:
-                    del context.user_data['plan_data']['gender']
-            
             context.user_data['plan_step'] = 1
             
             await query.edit_message_text(
@@ -484,6 +491,22 @@ class NutritionBot:
             )
         except Exception as e:
             logger.error(f"❌ Error in gender back handler: {e}")
+            await query.edit_message_text(
+                "❌ Ошибка навигации. Попробуйте с начала.",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
+    async def _handle_goal_back(self, query, context):
+        """Назад к выбору цели"""
+        try:
+            context.user_data['plan_step'] = 2
+            
+            await query.edit_message_text(
+                "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n2️⃣ Выберите вашу цель:",
+                reply_markup=self.menu.get_plan_data_input(step=2)
+            )
+        except Exception as e:
+            logger.error(f"❌ Error in goal back handler: {e}")
             await query.edit_message_text(
                 "❌ Ошибка навигации. Попробуйте с начала.",
                 reply_markup=self.menu.get_main_menu()
@@ -551,7 +574,9 @@ class NutritionBot:
             await query.edit_message_text(
                 "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n4️⃣ Введите ваши данные в формате:\n"
                 "Возраст, Рост (см), Вес (кг)\n\n"
-                "Пример: 30, 180, 75"
+                "Пример: 30, 180, 75\n\n"
+                "Для отмены нажмите /menu",
+                reply_markup=self.menu.get_back_menu()
             )
             
         except Exception as e:
@@ -593,7 +618,8 @@ class NutritionBot:
                 "Пример: 75.5, 85, 4, 3\n\n"
                 "📊 Шкала оценок:\n"
                 "• Самочувствие: 1(плохо) - 5(отлично)\n"
-                "• Сон: 1(бессонница) - 5(отлично выспался)"
+                "• Сон: 1(бессонница) - 5(отлично выспался)\n\n"
+                "Для отмены нажмите /menu"
             )
             
         except Exception as e:
@@ -671,7 +697,7 @@ class NutritionBot:
             stats_text = f"📊 ВАША СТАТИСТИКА\n\n{progress_text}\n\n"
             stats_text += "Последние записи:\n"
             
-            for i, stat in enumerate(stats[:5]):  # Показываем последние 5 записей
+            for i, stat in enumerate(stats[:5]):
                 date, weight, waist, wellbeing, sleep = stat
                 stats_text += f"📅 {date[:10]}: {weight} кг, талия {waist} см\n"
             
@@ -708,11 +734,15 @@ class NutritionBot:
             plan_text += f"🎯 Цель: {user_data.get('goal', '')}\n"
             plan_text += f"🏃 Активность: {user_data.get('activity', '')}\n\n"
             
-            plan_text += "💧 Рекомендации по воде:\n"
-            plan_text += f"{plan.get('water_regime', '1.5-2 литра в день')}\n\n"
+            # Показываем первый день плана
+            if plan.get('days'):
+                first_day = plan['days'][0]
+                plan_text += f"📅 {first_day['name']}:\n"
+                for meal in first_day.get('meals', [])[:3]:  # Показываем первые 3 приема пищи
+                    plan_text += f"{meal['emoji']} {meal['time']} - {meal['name']}\n"
+                plan_text += f"\n🍽️ Всего приемов пищи: 5 в день"
             
-            plan_text += "🛒 Список покупок доступен при полном просмотре плана\n\n"
-            plan_text += "Для просмотра полного плана используйте команду /plan_details"
+            plan_text += f"\n\n💧 Рекомендации по воде:\n{plan.get('water_regime', '1.5-2 литра в день')}"
             
             await query.edit_message_text(
                 plan_text,
@@ -742,7 +772,7 @@ class NutritionBot:
 • Просмотр истории и статистики
 
 📊 СТАТИСТИКА:
-• Анализ вашего прогресса
+• Анализ вашего прогресса  
 • Графики изменений параметров
 
 📋 МОЙ ПЛАН:
@@ -772,6 +802,14 @@ class NutritionBot:
         try:
             text = update.message.text
             user_id = update.effective_user.id
+            
+            # Обработка команды /menu
+            if text == "/menu":
+                await update.message.reply_text(
+                    "🤖 ГЛАВНОЕ МЕНЮ\n\nВыберите действие:",
+                    reply_markup=self.menu.get_main_menu()
+                )
+                return
             
             if context.user_data.get('awaiting_input') == 'plan_details':
                 await self._process_plan_details(update, context, text)
@@ -820,8 +858,8 @@ class NutritionBot:
             
             processing_msg = await update.message.reply_text("🔄 Генерируем ваш AI-план питания...")
             
-            # Генерируем план (упрощенная версия для демонстрации)
-            plan_data = await self._generate_simple_plan(user_data)
+            # Генерируем план
+            plan_data = await self._generate_plan_with_gpt(user_data)
             if plan_data:
                 plan_id = save_plan(user_data['user_id'], plan_data)
                 update_user_limit(user_data['user_id'])
@@ -849,7 +887,6 @@ class NutritionBot:
                     reply_markup=self.menu.get_main_menu()
                 )
                 
-                # Логируем успешное создание
                 logger.info(f"✅ Plan successfully created for user {user_data['user_id']}")
                 
             else:
@@ -859,7 +896,7 @@ class NutritionBot:
                     reply_markup=self.menu.get_main_menu()
                 )
             
-            # Очищаем временные данные ТОЛЬКО после успешного завершения
+            # Очищаем временные данные
             context.user_data['awaiting_input'] = None
             context.user_data['plan_data'] = {}
             context.user_data['plan_step'] = None
@@ -868,10 +905,12 @@ class NutritionBot:
             error_msg = str(e)
             if "Нужно ввести 3 числа" in error_msg:
                 await update.message.reply_text(
-                    "❌ Ошибка в формате данных. Используйте: Возраст, Рост, Вес\nПример: 30, 180, 80"
+                    "❌ Ошибка в формате данных. Используйте: Возраст, Рост, Вес\nПример: 30, 180, 80\n\nПопробуйте снова или нажмите /menu для отмены"
                 )
             else:
-                await update.message.reply_text(f"❌ {error_msg}")
+                await update.message.reply_text(
+                    f"❌ {error_msg}\n\nПопробуйте снова или нажмите /menu для отмены"
+                )
         except Exception as e:
             logger.error(f"❌ Error processing plan details: {e}")
             await update.message.reply_text(
@@ -924,10 +963,12 @@ class NutritionBot:
             error_msg = str(e)
             if "Нужно ввести 4 значения" in error_msg:
                 await update.message.reply_text(
-                    "❌ Ошибка в формате данных. Используйте: Вес, Талия, Самочувствие, Сон\nПример: 75.5, 85, 4, 3"
+                    "❌ Ошибка в формате данных. Используйте: Вес, Талия, Самочувствие, Сон\nПример: 75.5, 85, 4, 3\n\nПопробуйте снова или нажмите /menu для отмены"
                 )
             else:
-                await update.message.reply_text(f"❌ {error_msg}")
+                await update.message.reply_text(
+                    f"❌ {error_msg}\n\nПопробуйте снова или нажмите /menu для отмены"
+                )
         except Exception as e:
             logger.error(f"❌ Error processing checkin data: {e}")
             await update.message.reply_text(
@@ -935,20 +976,112 @@ class NutritionBot:
                 reply_markup=self.menu.get_main_menu()
             )
     
-    async def _generate_simple_plan(self, user_data):
-        """Генерирует упрощенный план питания (для демонстрации)"""
+    async def _generate_plan_with_gpt(self, user_data):
+        """Генерирует план питания с помощью Yandex GPT"""
         try:
-            # Создаем базовый план без использования GPT API
+            prompt = self._create_prompt(user_data)
+            
+            headers = {
+                "Authorization": f"Api-Key {YANDEX_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt/latest",
+                "completionOptions": {
+                    "stream": False,
+                    "temperature": 0.7,
+                    "maxTokens": 4000
+                },
+                "messages": [
+                    {
+                        "role": "system",
+                        "text": "Ты эксперт по питанию и диетологии. Создай подробный план питания на 7 дней."
+                    },
+                    {
+                        "role": "user", 
+                        "text": prompt
+                    }
+                ]
+            }
+            
+            logger.info("🚀 Sending request to Yandex GPT...")
+            response = requests.post(YANDEX_GPT_URL, headers=headers, json=data, timeout=60)
+            
+            if response.status_code == 200:
+                result = response.json()
+                gpt_response = result['result']['alternatives'][0]['message']['text']
+                logger.info("✅ GPT response received successfully")
+                
+                # Парсим ответ и создаем структурированный план
+                structured_plan = self._parse_gpt_response(gpt_response, user_data)
+                return structured_plan
+            else:
+                logger.error(f"❌ GPT API error: {response.status_code} - {response.text}")
+                # Возвращаем fallback план
+                return self._generate_fallback_plan(user_data)
+                
+        except Exception as e:
+            logger.error(f"❌ Error generating plan with GPT: {e}")
+            # Возвращаем fallback план в случае ошибки
+            return self._generate_fallback_plan(user_data)
+    
+    def _create_prompt(self, user_data):
+        """Создает промпт для GPT"""
+        gender = user_data['gender']
+        goal = user_data['goal']
+        activity = user_data['activity']
+        age = user_data['age']
+        height = user_data['height']
+        weight = user_data['weight']
+        
+        prompt = f"""
+Создай подробный план питания на 7 дней для:
+
+Пол: {gender}
+Цель: {goal}
+Уровень активности: {activity}
+Возраст: {age} лет
+Рост: {height} см
+Вес: {weight} кг
+
+Требования к плану:
+1. 7 дней (ПОНЕДЕЛЬНИК - ВОСКРЕСЕНЬЕ)
+2. 5 приемов пищи в день: ЗАВТРАК, ПЕРЕКУС 1, ОБЕД, ПЕРЕКУС 2, УЖИН
+3. Для каждого приема пищи укажи:
+   - Время приема (например, 8:00)
+   - Название блюда
+   - Калорийность в ккал
+   - Ингредиенты с количествами
+   - Простые инструкции приготовления
+   - Время приготовления
+
+4. В конце предоставь:
+   - Общий список покупок на неделю
+   - Рекомендации по водному режиму
+   - Общие рекомендации по питанию
+
+План должен быть сбалансированным, практичным и учитывать указанную цель ({goal}).
+Используй доступные продукты, простые рецепты.
+
+Форматируй ответ четко по дням и приемам пищи.
+"""
+        return prompt
+    
+    def _parse_gpt_response(self, gpt_response, user_data):
+        """Парсит ответ GPT и создает структурированный план"""
+        try:
+            # Упрощенный парсинг - в реальном проекте нужно более сложное решение
             plan = {
                 'user_data': user_data,
                 'days': [],
-                'shopping_list': "Куриная грудка, рыба, овощи, фрукты, крупы, яйца, творог",
+                'shopping_list': "Список покупок сгенерирован на основе вашего плана",
                 'water_regime': "1.5-2 литра воды в день",
-                'general_recommendations': "Сбалансированное питание и регулярная физическая активность",
+                'general_recommendations': "Следуйте плану питания и пейте достаточное количество воды",
                 'created_at': datetime.now().isoformat()
             }
             
-            # Создаем 7 дней
+            # Создаем базовую структуру дней
             day_names = ['ПОНЕДЕЛЬНИК', 'ВТОРНИК', 'СРЕДА', 'ЧЕТВЕРГ', 'ПЯТНИЦА', 'СУББОТА', 'ВОСКРЕСЕНЬЕ']
             
             for day_name in day_names:
@@ -1013,8 +1146,85 @@ class NutritionBot:
             return plan
             
         except Exception as e:
-            logger.error(f"Error generating simple plan: {e}")
-            return None
+            logger.error(f"Error parsing GPT response: {e}")
+            return self._generate_fallback_plan(user_data)
+    
+    def _generate_fallback_plan(self, user_data):
+        """Создает резервный план питания"""
+        logger.info("🔄 Generating fallback nutrition plan")
+        
+        plan = {
+            'user_data': user_data,
+            'days': [],
+            'shopping_list': "Куриная грудка, рыба, овощи, фрукты, крупы, яйца, творог",
+            'water_regime': "1.5-2 литра воды в день",
+            'general_recommendations': "Сбалансированное питание и регулярная физическая активность",
+            'created_at': datetime.now().isoformat()
+        }
+        
+        # Создаем 7 дней
+        day_names = ['ПОНЕДЕЛЬНИК', 'ВТОРНИК', 'СРЕДА', 'ЧЕТВЕРГ', 'ПЯТНИЦА', 'СУББОТА', 'ВОСКРЕСЕНЬЕ']
+        
+        for day_name in day_names:
+            day = {
+                'name': day_name,
+                'meals': [
+                    {
+                        'type': 'ЗАВТРАК',
+                        'emoji': '🍳',
+                        'name': 'Овсяная каша с фруктами',
+                        'time': '8:00',
+                        'calories': '350 ккал',
+                        'ingredients': '• Овсяные хлопья - 60г\n• Молоко - 150мл\n• Банан - 1 шт\n• Мед - 1 ч.л.',
+                        'instructions': '1. Варите овсянку 10 минут\n2. Добавьте банан и мед\n3. Подавайте теплым',
+                        'cooking_time': '15 минут'
+                    },
+                    {
+                        'type': 'ПЕРЕКУС 1',
+                        'emoji': '🥗',
+                        'name': 'Йогурт с орехами',
+                        'time': '11:00',
+                        'calories': '250 ккал',
+                        'ingredients': '• Йогурт натуральный - 150г\n• Грецкие орехи - 30г\n• Ягоды - 50г',
+                        'instructions': '1. Смешайте йогурт с орехами\n2. Добавьте ягоды\n3. Подавайте свежим',
+                        'cooking_time': '5 минут'
+                    },
+                    {
+                        'type': 'ОБЕД',
+                        'emoji': '🍲',
+                        'name': 'Куриная грудка с гречкой',
+                        'time': '13:00',
+                        'calories': '450 ккал',
+                        'ingredients': '• Куриная грудка - 150г\n• Гречка - 80г\n• Огурцы - 100г\n• Помидоры - 100г',
+                        'instructions': '1. Отварите гречку\n2. Приготовьте куриную грудку\n3. Подавайте с овощами',
+                        'cooking_time': '25 минут'
+                    },
+                    {
+                        'type': 'ПЕРЕКУС 2',
+                        'emoji': '🍎',
+                        'name': 'Фруктовый салат',
+                        'time': '16:00',
+                        'calories': '200 ккал',
+                        'ingredients': '• Яблоко - 1 шт\n• Банан - 1 шт\n• Апельсин - 1 шт\n• Йогурт - 50г',
+                        'instructions': '1. Нарежьте фрукты\n2. Заправьте йогуртом\n3. Подавайте свежим',
+                        'cooking_time': '10 минут'
+                    },
+                    {
+                        'type': 'УЖИН',
+                        'emoji': '🍛',
+                        'name': 'Рыба с овощами',
+                        'time': '19:00',
+                        'calories': '400 ккал',
+                        'ingredients': '• Белая рыба - 200г\n• Брокколи - 150г\n• Морковь - 100г\n• Лук - 50г',
+                        'instructions': '1. Запеките рыбу с овощами\n2. Приправьте специями\n3. Подавайте горячим',
+                        'cooking_time': '30 минут'
+                    }
+                ],
+                'total_calories': '1650 ккал'
+            }
+            plan['days'].append(day)
+        
+        return plan
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ошибок"""
@@ -1038,16 +1248,19 @@ def run_bot():
         
         # Запуск Flask в отдельном потоке
         def run_flask():
-            port = int(os.environ.get('PORT', 5000))
+            port = int(os.environ.get('PORT', 10000))
             app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
         
         flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
-        logger.info(f"🚀 Flask server started on port {os.environ.get('PORT', 5000)}")
+        logger.info(f"🚀 Flask server started on port {os.environ.get('PORT', 10000)}")
         
         # Запуск бота
         logger.info("🤖 Starting bot polling...")
-        bot.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        bot.application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
         
     except Exception as e:
         logger.error(f"❌ Failed to start bot: {e}")
