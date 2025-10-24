@@ -1,16 +1,10 @@
 import os
 import logging
-import threading
-import time
 import sqlite3
 import json
 import requests
-import signal
-import atexit
-import socket
 import sys
-import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
@@ -409,6 +403,7 @@ class NutritionBot:
         init_database()
         
         try:
+            # Инициализация для версии 20.8
             self.application = Application.builder().token(self.bot_token).build()
             self.menu = InteractiveMenu()
             self._setup_handlers()
@@ -1586,6 +1581,7 @@ def run_bot():
         bot = NutritionBot()
         
         # Запускаем Flask в отдельном потоке
+        import threading
         def run_flask():
             app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
         
@@ -1595,7 +1591,7 @@ def run_bot():
         
         # Запускаем бота
         logger.info("✅ Starting bot polling...")
-        bot.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        bot.application.run_polling()
         
     except Exception as e:
         logger.error(f"❌ Failed to start bot: {e}")
