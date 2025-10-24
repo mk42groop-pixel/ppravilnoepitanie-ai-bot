@@ -401,15 +401,19 @@ def check_database_health():
         conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
         cursor = conn.cursor()
         
-        cursor.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'")
-        table_count = cursor.fetchone()[0]
+        # Проверяем существование таблиц
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall()]
         
         required_tables = ['users', 'nutrition_plans', 'daily_checkins', 'user_limits', 'shopping_cart']
-        for table in required_tables:
-            cursor.execute(f"SELECT COUNT(*) FROM {table} LIMIT 1")
+        missing_tables = [table for table in required_tables if table not in tables]
+        
+        if missing_tables:
+            logger.warning(f"Missing tables: {missing_tables}")
+            # Автоматически создаем недостающие таблицы
+            init_database()
         
         conn.close()
-        
         health_monitor.update_db_status("healthy")
         return True
         
@@ -505,7 +509,8 @@ class YandexGPT:
                 "messages": [
                     {
                         "role": "system",
-                        "text": """Ты - профессиональный диетолог. Создай персонализированный план питания на 7 дней. Формат строго JSON."""
+                        "text": """Ты - профессиональный диетолог. Создай персонализированный план питания на 7 дней. 
+Включи рекомендации по потреблению воды. Формат строго JSON."""
                     },
                     {
                         "role": "user",
@@ -524,6 +529,11 @@ class YandexGPT:
                 if json_match:
                     plan_json = json.loads(json_match.group())
                     plan_json['user_data'] = user_data
+                    
+                    # Добавляем рекомендации по воде если их нет
+                    if 'water_recommendation' not in plan_json:
+                        plan_json['water_recommendation'] = self._get_water_recommendation(user_data)
+                    
                     return plan_json
                 else:
                     logger.error("No JSON found in GPT response")
@@ -565,10 +575,39 @@ class YandexGPT:
 - Список ингредиентов с количествами
 - Пошаговые инструкции приготовления
 - Время приготовления
+- Рекомендации по потреблению воды
 
 Верни ответ ТОЛЬКО в формате JSON без дополнительного текста.
 """
         return prompt
+    
+    def _get_water_recommendation(self, user_data):
+        """Генерирует рекомендации по воде на основе данных пользователя"""
+        weight = user_data.get('weight', 70)
+        activity = user_data.get('activity', '')
+        
+        # Базовая формула: 30-40 мл на кг веса
+        base_water = weight * 35
+        
+        # Корректировка по активности
+        activity_multiplier = {
+            'НИЗКАЯ': 1.0,
+            'СРЕДНЯЯ': 1.2,
+            'ВЫСОКАЯ': 1.4
+        }.get(activity, 1.2)
+        
+        recommended_water = int(base_water * activity_multiplier)
+        
+        return {
+            "daily_recommendation": f"{recommended_water} мл",
+            "description": f"Рекомендуется выпивать {recommended_water} мл воды в день. Распределите равномерно в течение дня.",
+            "tips": [
+                "1-2 стакана утром натощак",
+                "По 1 стакану перед каждым приемом пищи", 
+                "Во время тренировок - дополнительно 500-1000 мл",
+                "Ограничьте потребление за 2 часа до сна"
+            ]
+        }
     
     def _generate_demo_plan(self, user_data):
         """Резервный демо-план"""
@@ -576,65 +615,68 @@ class YandexGPT:
         
         plan = {
             'user_data': user_data,
+            'water_recommendation': self._get_water_recommendation(user_data),
             'days': []
         }
+        
+        demo_meals = [
+            {
+                'type': 'ЗАВТРАК',
+                'time': '08:00',
+                'emoji': '🍳',
+                'name': 'Овсянка с фруктами',
+                'calories': '350 ккал',
+                'ingredients': '• Овсяные хлопья - 50г\n• Молоко - 200мл\n• Банан - 1 шт\n• Мед - 1 ч.л.',
+                'instructions': '1. Сварите овсянку на молоке\n2. Добавьте банан и мед',
+                'cooking_time': '15 мин'
+            },
+            {
+                'type': 'ПЕРЕКУС 1', 
+                'time': '11:00',
+                'emoji': '🥗',
+                'name': 'Йогурт с орехами',
+                'calories': '200 ккал',
+                'ingredients': '• Греческий йогурт - 150г\n• Миндаль - 30г\n• Ягоды - 50г',
+                'instructions': '1. Смешайте йогурт с орехами\n2. Добавьте ягоды',
+                'cooking_time': '2 мин'
+            },
+            {
+                'type': 'ОБЕД',
+                'time': '14:00', 
+                'emoji': '🍲',
+                'name': 'Куриная грудка с гречкой',
+                'calories': '450 ккал',
+                'ingredients': '• Куриная грудка - 150г\n• Гречка - 100г\n• Овощи - 200г\n• Масло оливковое - 1 ст.л.',
+                'instructions': '1. Отварите гречку\n2. Обжарьте куриную грудку\n3. Потушите овощи',
+                'cooking_time': '25 мин'
+            },
+            {
+                'type': 'ПЕРЕКУС 2',
+                'time': '17:00',
+                'emoji': '🍎', 
+                'name': 'Творог с фруктами',
+                'calories': '180 ккал',
+                'ingredients': '• Творог обезжиренный - 150г\n• Яблоко - 1 шт\n• Корица - щепотка',
+                'instructions': '1. Нарежьте яблоко\n2. Смешайте с творогом\n3. Посыпьте корицей',
+                'cooking_time': '5 мин'
+            },
+            {
+                'type': 'УЖИН',
+                'time': '20:00',
+                'emoji': '🍛',
+                'name': 'Рыба на пару с овощами',
+                'calories': '400 ккал', 
+                'ingredients': '• Филе рыбы - 200г\n• Брокколи - 150г\n• Морковь - 1 шт\n• Лимон - 1 долька',
+                'instructions': '1. Приготовьте рыбу на пару\n2. Отварите овощи\n3. Подавайте с лимоном',
+                'cooking_time': '20 мин'
+            }
+        ]
         
         for day_name in days:
             day_plan = {
                 'name': day_name,
                 'total_calories': '1800-2000 ккал',
-                'meals': [
-                    {
-                        'type': 'ЗАВТРАК',
-                        'time': '08:00',
-                        'emoji': '🍳',
-                        'name': 'Овсянка с фруктами',
-                        'calories': '350 ккал',
-                        'ingredients': '• Овсяные хлопья - 50г\n• Молоко - 200мл\n• Банан - 1 шт\n• Мед - 1 ч.л.',
-                        'instructions': '1. Сварите овсянку на молоке\n2. Добавьте банан и мед',
-                        'cooking_time': '15 мин'
-                    },
-                    {
-                        'type': 'ПЕРЕКУС 1', 
-                        'time': '11:00',
-                        'emoji': '🥗',
-                        'name': 'Йогурт с орехами',
-                        'calories': '200 ккал',
-                        'ingredients': '• Греческий йогурт - 150г\n• Миндаль - 30г\n• Ягоды - 50г',
-                        'instructions': '1. Смешайте йогурт с орехами\n2. Добавьте ягоды',
-                        'cooking_time': '2 мин'
-                    },
-                    {
-                        'type': 'ОБЕД',
-                        'time': '14:00', 
-                        'emoji': '🍲',
-                        'name': 'Куриная грудка с гречкой',
-                        'calories': '450 ккал',
-                        'ingredients': '• Куриная грудка - 150г\n• Гречка - 100г\n• Овощи - 200г\n• Масло оливковое - 1 ст.л.',
-                        'instructions': '1. Отварите гречку\n2. Обжарьте куриную грудку\n3. Потушите овощи',
-                        'cooking_time': '25 мин'
-                    },
-                    {
-                        'type': 'ПЕРЕКУС 2',
-                        'time': '17:00',
-                        'emoji': '🍎', 
-                        'name': 'Творог с фруктами',
-                        'calories': '180 ккал',
-                        'ingredients': '• Творог обезжиренный - 150г\n• Яблоко - 1 шт\n• Корица - щепотка',
-                        'instructions': '1. Нарежьте яблоко\n2. Смешайте с творогом\n3. Посыпьте корицей',
-                        'cooking_time': '5 мин'
-                    },
-                    {
-                        'type': 'УЖИН',
-                        'time': '20:00',
-                        'emoji': '🍛',
-                        'name': 'Рыба на пару с овощами',
-                        'calories': '400 ккал', 
-                        'ingredients': '• Филе рыбы - 200г\n• Брокколи - 150г\n• Морковь - 1 шт\n• Лимон - 1 долька',
-                        'instructions': '1. Приготовьте рыбу на пару\n2. Отварите овощи\n3. Подавайте с лимоном',
-                        'cooking_time': '20 мин'
-                    }
-                ]
+                'meals': demo_meals.copy()
             }
             plan['days'].append(day_plan)
         
@@ -655,6 +697,7 @@ class InteractiveMenu:
             [InlineKeyboardButton("📊 СТАТИСТИКА", callback_data="stats")],
             [InlineKeyboardButton("📋 МОЙ ПЛАН", callback_data="my_plan")],
             [InlineKeyboardButton("🛒 КОРЗИНА", callback_data="shopping_cart")],
+            [InlineKeyboardButton("💧 ВОДНЫЙ РЕЖИМ", callback_data="water_mode")],
             [InlineKeyboardButton("❓ ПОМОЩЬ", callback_data="help")]
         ]
         return InlineKeyboardMarkup(keyboard)
@@ -699,6 +742,16 @@ class InteractiveMenu:
             [InlineKeyboardButton("📅 ПРОСМОТРЕТЬ НЕДЕЛЮ", callback_data="view_week")],
             [InlineKeyboardButton("📄 СКАЧАТЬ В TXT", callback_data="download_plan")],
             [InlineKeyboardButton("📊 ИНФО О ПЛАНАХ", callback_data="plan_info")],
+            [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_main")]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    def get_water_menu(self):
+        """Меню водного режима"""
+        keyboard = [
+            [InlineKeyboardButton("💧 РЕКОМЕНДАЦИИ ПО ВОДЕ", callback_data="water_recommendations")],
+            [InlineKeyboardButton("⏱ НАПОМИНАНИЯ О ВОДЕ", callback_data="water_reminders")],
+            [InlineKeyboardButton("📊 МОЯ СТАТИСТИКА ВОДЫ", callback_data="water_stats")],
             [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_main")]
         ]
         return InlineKeyboardMarkup(keyboard)
@@ -869,6 +922,7 @@ class NutritionBot:
             health_monitor.update_bot_status("error")
             raise ValueError("BOT_TOKEN is required")
             
+        # Сначала инициализируем базу данных
         init_database()
         
         try:
@@ -886,6 +940,7 @@ class NutritionBot:
             raise
     
     def _setup_handlers(self):
+        """Настройка обработчиков - ВСЕ методы должны быть реализованы"""
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("menu", self.menu_command))
         self.application.add_handler(CommandHandler("dbstats", self.dbstats_command))
@@ -896,8 +951,62 @@ class NutritionBot:
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         self.application.add_error_handler(self.error_handler)
     
-    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def dbstats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для просмотра статистики БД"""
         health_monitor.increment_request()
+        try:
+            user_id = update.effective_user.id
+            if not is_admin(user_id):
+                await update.message.reply_text("❌ Эта команда только для администратора")
+                return
+            
+            conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(*) FROM users")
+            users_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM nutrition_plans")
+            plans_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM daily_checkins")
+            checkins_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM shopping_cart")
+            cart_count = cursor.fetchone()[0]
+            
+            conn.close()
+            
+            stats_text = f"""
+📊 СТАТИСТИКА БАЗЫ ДАННЫХ:
+
+👥 Пользователей: {users_count}
+📋 Планов питания: {plans_count}
+📈 Чек-инов: {checkins_count}
+🛒 Записей в корзинах: {cart_count}
+"""
+            await update.message.reply_text(stats_text)
+            
+        except Exception as e:
+            health_monitor.increment_error()
+            await update.message.reply_text("❌ Ошибка при получении статистики БД")
+    
+    async def export_plan_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для экспорта плана в TXT"""
+        health_monitor.increment_request()
+        try:
+            user_id = update.effective_user.id
+            await update.message.reply_text("📄 Подготавливаем ваш план для скачивания...")
+            await self.send_plan_as_file(update, context, user_id)
+            
+        except Exception as e:
+            health_monitor.increment_error()
+            await update.message.reply_text("❌ Ошибка при подготовке плана для скачивания")
+    
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для проверки статуса бота"""
+        health_monitor.increment_request()
+        
         stats = health_monitor.get_stats()
         status_text = f"""
 🤖 **СТАТУС БОТА**
@@ -912,17 +1021,24 @@ class NutritionBot:
 • Запросов: {stats['request_count']}
 • Ошибок: {stats['error_count']}
 • Успешность: {stats['success_rate']:.1f}%
+
+🕒 Последняя проверка: {stats['last_health_check']}
 """
         await update.message.reply_text(status_text)
     
     async def wake_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для пробуждения бота"""
         health_monitor.increment_request()
+        
         check_database_health()
         check_telegram_api_health()
+        
         await update.message.reply_text("🤖 Бот активен и работает! ✅")
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /start"""
         health_monitor.increment_request()
+        
         try:
             user = update.effective_user
             user_data = {
@@ -933,27 +1049,42 @@ class NutritionBot:
             }
             save_user(user_data)
             
-            welcome_text = "🎯 Добро пожаловать в бот персонализированного питания с AI!"
+            welcome_text = """
+🎯 Добро пожаловать в бот персонализированного питания с AI!
+
+Выберите действие из меню ниже:
+"""
             if is_admin(user.id):
                 welcome_text += "\n👑 ВЫ АДМИНИСТРАТОР: безлимитный доступ к планам!"
             
-            await update.message.reply_text(welcome_text, reply_markup=self.menu.get_main_menu())
+            await update.message.reply_text(
+                welcome_text,
+                reply_markup=self.menu.get_main_menu()
+            )
             
         except Exception as e:
             health_monitor.increment_error()
+            logger.error(f"Error in start_command: {e}")
             await update.message.reply_text("❌ Произошла ошибка. Попробуйте позже.")
     
     async def menu_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает главное меню"""
         health_monitor.increment_request()
-        await update.message.reply_text("🤖 ГЛАВНОЕ МЕНЮ", reply_markup=self.menu.get_main_menu())
+        await update.message.reply_text(
+            "🤖 ГЛАВНОЕ МЕНЮ\n\nВыберите действие:",
+            reply_markup=self.menu.get_main_menu()
+        )
     
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик callback'ов"""
         query = update.callback_query
         await query.answer()
+        
         data = query.data
-        logger.info(f"Callback: {data}")
+        logger.info(f"Callback received: {data}")
         
         try:
+            # Основные команды меню
             if data == "create_plan":
                 await self._handle_create_plan(query, context)
             elif data == "checkin":
@@ -964,41 +1095,489 @@ class NutritionBot:
                 await self._handle_my_plan_menu(query, context)
             elif data == "shopping_cart":
                 await self._handle_shopping_cart(query, context)
+            elif data == "water_mode":
+                await self._handle_water_mode(query, context)
             elif data == "help":
                 await self._handle_help(query, context)
+            elif data == "plan_info":
+                await self._handle_plan_info(query, context)
+            elif data == "download_plan":
+                await self._handle_download_plan(query, context)
+            elif data == "view_week":
+                await self._handle_view_week(query, context)
+            elif data == "download_shopping_list":
+                await self._handle_download_shopping_list(query, context)
+            elif data == "back_to_plan_menu":
+                await self._handle_my_plan_menu(query, context)
+            
+            # Навигация назад
             elif data == "back_main":
                 await self._show_main_menu(query)
+            elif data == "back_gender":
+                await self._handle_gender_back(query, context)
+            elif data == "back_goal":
+                await self._handle_goal_back(query, context)
+            
+            # Ввод данных плана
+            elif data.startswith("gender_"):
+                await self._handle_gender(query, context, data)
+            elif data.startswith("goal_"):
+                await self._handle_goal(query, context, data)
+            elif data.startswith("activity_"):
+                await self._handle_activity(query, context, data)
+            
+            # Чек-ин
+            elif data == "checkin_data":
+                await self._handle_checkin_data(query, context)
+            elif data == "checkin_history":
+                await self._handle_checkin_history(query, context)
+            
+            # Водный режим
+            elif data == "water_recommendations":
+                await self._handle_water_recommendations(query, context)
+            elif data == "water_reminders":
+                await self._handle_water_reminders(query, context)
+            elif data == "water_stats":
+                await self._handle_water_stats(query, context)
+            
+            # Просмотр недели и приемов пищи
+            elif data.startswith("day_"):
+                await self._handle_day_selection(query, context, data)
+            elif data.startswith("meal_"):
+                await self._handle_meal_selection(query, context, data)
+            elif data.startswith("next_meal_"):
+                await self._handle_next_meal(query, context, data)
+            
+            # Корзина покупок
+            elif data.startswith("toggle_"):
+                await self._handle_toggle_cart_item(query, context, data)
+            elif data.startswith("cart_page_"):
+                await self._handle_cart_page(query, context, data)
+            elif data == "refresh_cart":
+                await self._handle_refresh_cart(query, context)
+            elif data == "clear_cart":
+                await self._handle_clear_cart(query, context)
+            
             else:
-                await query.edit_message_text("❌ Неизвестная команда", reply_markup=self.menu.get_main_menu())
+                logger.warning(f"Unknown callback data: {data}")
+                await query.edit_message_text(
+                    "❌ Неизвестная команда",
+                    reply_markup=self.menu.get_main_menu()
+                )
                 
         except Exception as e:
             health_monitor.increment_error()
-            await query.edit_message_text("❌ Ошибка", reply_markup=self.menu.get_main_menu())
+            logger.error(f"Error in callback handler: {e}")
+            await query.edit_message_text(
+                "❌ Произошла ошибка. Попробуйте снова.",
+                reply_markup=self.menu.get_main_menu()
+            )
     
     async def _handle_create_plan(self, query, context):
+        """Обработчик создания плана"""
+        try:
+            user_id = query.from_user.id
+            
+            if not is_admin(user_id) and not can_make_request(user_id):
+                days_remaining = get_days_until_next_plan(user_id)
+                await query.edit_message_text(
+                    f"⏳ Вы уже запрашивали план питания\nСледующий доступен через {days_remaining} дней",
+                    reply_markup=self.menu.get_main_menu()
+                )
+                return
+            
+            context.user_data['plan_data'] = {}
+            context.user_data['plan_step'] = 1
+            
+            await query.edit_message_text(
+                "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n1️⃣ Выберите ваш пол:",
+                reply_markup=self.menu.get_plan_data_input(step=1)
+            )
+            
+        except Exception as e:
+            health_monitor.increment_error()
+            await query.edit_message_text(
+                "❌ Ошибка при создании плана",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
+    async def _handle_gender_back(self, query, context):
+        """Назад к выбору пола"""
+        context.user_data['plan_step'] = 1
+        await query.edit_message_text(
+            "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n1️⃣ Выберите ваш пол:",
+            reply_markup=self.menu.get_plan_data_input(step=1)
+        )
+    
+    async def _handle_goal_back(self, query, context):
+        """Назад к выбору цели"""
+        context.user_data['plan_step'] = 2
+        await query.edit_message_text(
+            "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n2️⃣ Выберите вашу цель:",
+            reply_markup=self.menu.get_plan_data_input(step=2)
+        )
+    
+    async def _handle_gender(self, query, context, data):
+        """Обработчик выбора пола"""
+        gender_map = {
+            "gender_male": "МУЖЧИНА",
+            "gender_female": "ЖЕНЩИНА"
+        }
+        
+        context.user_data['plan_data']['gender'] = gender_map[data]
+        context.user_data['plan_step'] = 2
+        
+        await query.edit_message_text(
+            "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n2️⃣ Выберите вашу цель:",
+            reply_markup=self.menu.get_plan_data_input(step=2)
+        )
+    
+    async def _handle_goal(self, query, context, data):
+        """Обработчик выбора цели"""
+        goal_map = {
+            "goal_weight_loss": "ПОХУДЕНИЕ",
+            "goal_mass": "НАБОР МАССЫ", 
+            "goal_maintain": "ПОДДЕРЖАНИЕ"
+        }
+        
+        context.user_data['plan_data']['goal'] = goal_map[data]
+        context.user_data['plan_step'] = 3
+        
+        await query.edit_message_text(
+            "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n3️⃣ Выберите уровень активности:",
+            reply_markup=self.menu.get_plan_data_input(step=3)
+        )
+    
+    async def _handle_activity(self, query, context, data):
+        """Обработчик выбора активности"""
+        activity_map = {
+            "activity_high": "ВЫСОКАЯ",
+            "activity_medium": "СРЕДНЯЯ",
+            "activity_low": "НИЗКАЯ"
+        }
+        
+        context.user_data['plan_data']['activity'] = activity_map[data]
+        context.user_data['awaiting_input'] = 'plan_details'
+        
+        await query.edit_message_text(
+            "📊 СОЗДАНИЕ ПЛАНА ПИТАНИЯ\n\n4️⃣ Введите ваши данные в формате:\n"
+            "Возраст, Рост (см), Вес (кг)\n\n"
+            "Пример: 30, 180, 75\n\n"
+            "Для отмены нажмите /menu",
+            reply_markup=self.menu.get_back_menu()
+        )
+    
+    async def _handle_checkin_menu(self, query, context):
+        """Обработчик меню чек-ина"""
+        await query.edit_message_text(
+            "📈 ЕЖЕДНЕВНЫЙ ЧЕК-ИН\n\n"
+            "Отслеживайте ваш прогресс:\n"
+            "• Вес\n• Обхват талии\n• Самочувствие\n• Качество сна\n\n"
+            "Выберите действие:",
+            reply_markup=self.menu.get_checkin_menu()
+        )
+    
+    async def _handle_checkin_data(self, query, context):
+        """Обработчик ввода данных чек-ина"""
+        context.user_data['awaiting_input'] = 'checkin_data'
+        await query.edit_message_text(
+            "📝 ВВЕДИТЕ ДАННЫЕ ЧЕК-ИНА\n\n"
+            "Введите данные в формате:\n"
+            "Вес (кг), Обхват талии (см), Самочувствие (1-5), Сон (1-5)\n\n"
+            "Пример: 75.5, 85, 4, 3\n\n"
+            "Для отмены нажмите /menu"
+        )
+    
+    async def _handle_checkin_history(self, query, context):
+        """Обработчик истории чек-инов"""
         user_id = query.from_user.id
-        if not is_admin(user_id) and not can_make_request(user_id):
-            days_remaining = get_days_until_next_plan(user_id)
-            await query.edit_message_text(f"⏳ Следующий план через {days_remaining} дней", reply_markup=self.menu.get_main_menu())
+        stats = get_user_stats(user_id)
+        
+        if not stats:
+            await query.edit_message_text(
+                "📊 У вас пока нет данных чек-инов",
+                reply_markup=self.menu.get_checkin_menu()
+            )
             return
         
-        context.user_data['plan_data'] = {}
-        context.user_data['plan_step'] = 1
-        await query.edit_message_text("📊 СОЗДАНИЕ ПЛАНА\n\n1️⃣ Выберите пол:", reply_markup=self.menu.get_plan_data_input(step=1))
+        stats_text = "📊 ИСТОРИЯ ВАШИХ ЧЕК-ИНОВ:\n\n"
+        for stat in stats:
+            date, weight, waist, wellbeing, sleep = stat
+            stats_text += f"📅 {date[:10]}: {weight} кг, талия {waist} см\n"
+        
+        await query.edit_message_text(stats_text, reply_markup=self.menu.get_checkin_menu())
+    
+    async def _handle_stats(self, query, context):
+        """Обработчик статистики"""
+        user_id = query.from_user.id
+        stats = get_user_stats(user_id)
+        
+        if not stats:
+            await query.edit_message_text(
+                "📊 У вас пока нет данных для статистики",
+                reply_markup=self.menu.get_main_menu()
+            )
+            return
+        
+        stats_text = "📊 ВАША СТАТИСТИКА\n\nПоследние записи:\n"
+        for i, stat in enumerate(stats[:5]):
+            date, weight, waist, wellbeing, sleep = stat
+            stats_text += f"📅 {date[:10]}: {weight} кг, талия {waist} см\n"
+        
+        await query.edit_message_text(stats_text, reply_markup=self.menu.get_main_menu())
     
     async def _handle_my_plan_menu(self, query, context):
+        """Обработчик меню моего плана"""
         user_id = query.from_user.id
         plan = get_latest_plan(user_id)
         
         if not plan:
-            await query.edit_message_text("📋 У вас пока нет планов", reply_markup=self.menu.get_main_menu())
+            await query.edit_message_text(
+                "📋 У вас пока нет созданных планов питания",
+                reply_markup=self.menu.get_main_menu()
+            )
             return
         
         user_data = plan.get('user_data', {})
-        menu_text = f"📋 УПРАВЛЕНИЕ ПЛАНОМ\n\n👤 {user_data.get('gender', '')}, {user_data.get('age', '')} лет"
-        await query.edit_message_text(menu_text, reply_markup=self.menu.get_plan_management_menu())
+        menu_text = f"📋 УПРАВЛЕНИЕ ПЛАНОМ ПИТАНИЯ\n\n"
+        menu_text += f"👤 {user_data.get('gender', '')}, {user_data.get('age', '')} лет\n"
+        menu_text += f"📏 {user_data.get('height', '')} см, {user_data.get('weight', '')} кг\n"
+        menu_text += "Выберите действие:"
+        
+        await query.edit_message_text(
+            menu_text,
+            reply_markup=self.menu.get_plan_management_menu()
+        )
+    
+    async def _handle_plan_info(self, query, context):
+        """Обработчик информации о планах"""
+        user_id = query.from_user.id
+        plans_count = get_user_plans_count(user_id)
+        days_remaining = get_days_until_next_plan(user_id)
+        
+        info_text = f"📊 ИНФОРМАЦИЯ О ВАШИХ ПЛАНАХ\n\n"
+        info_text += f"📋 Создано планов: {plans_count}\n"
+        
+        if is_admin(user_id):
+            info_text += "👑 Статус: АДМИНИСТРАТОР\n"
+        else:
+            if days_remaining > 0:
+                info_text += f"⏳ Следующий план через: {days_remaining} дней\n"
+            else:
+                info_text += "✅ Можете создать новый план!\n"
+        
+        await query.edit_message_text(
+            info_text,
+            reply_markup=self.menu.get_plan_management_menu()
+        )
+    
+    async def _handle_download_plan(self, query, context):
+        """Обработчик скачивания плана"""
+        user_id = query.from_user.id
+        await self.send_plan_as_file(query, context, user_id)
+    
+    async def _handle_view_week(self, query, context):
+        """Обработчик просмотра недели"""
+        user_id = query.from_user.id
+        plan = get_latest_plan(user_id)
+        
+        if not plan:
+            await query.edit_message_text(
+                "❌ У вас нет активного плана питания",
+                reply_markup=self.menu.get_main_menu()
+            )
+            return
+        
+        week_text = "📅 ВАШ ПЛАН ПИТАНИЯ НА НЕДЕЛЮ\n\n"
+        week_text += "Выберите день для просмотра деталей:\n\n"
+        
+        for i, day in enumerate(plan.get('days', [])):
+            week_text += f"📅 {day['name']}\n"
+            week_text += f"🔥 {day.get('total_calories', '~1800 ккал')}\n\n"
+        
+        await query.edit_message_text(
+            week_text,
+            reply_markup=self.menu.get_week_days_menu()
+        )
+    
+    async def _handle_day_selection(self, query, context, data):
+        """Обработчик выбора дня"""
+        day_index = int(data.split('_')[1])
+        user_id = query.from_user.id
+        plan = get_latest_plan(user_id)
+        
+        if not plan or day_index >= len(plan.get('days', [])):
+            await query.edit_message_text(
+                "❌ Ошибка при загрузке дня",
+                reply_markup=self.menu.get_week_days_menu()
+            )
+            return
+        
+        day = plan['days'][day_index]
+        day_text = f"📅 {day['name']}\n\n"
+        day_text += f"🔥 Общая калорийность: {day.get('total_calories', '~1800 ккал')}\n\n"
+        day_text += "🍽 Приемы пищи:\n\n"
+        
+        for i, meal in enumerate(day.get('meals', [])):
+            day_text += f"{meal['emoji']} {meal['type']} ({meal['time']})\n"
+            day_text += f"   {meal['name']} - {meal['calories']}\n\n"
+        
+        day_text += "Выберите прием пищи для просмотра деталей:"
+        
+        await query.edit_message_text(
+            day_text,
+            reply_markup=self.menu.get_day_meals_menu(day_index)
+        )
+    
+    async def _handle_meal_selection(self, query, context, data):
+        """Обработчик выбора приема пищи"""
+        parts = data.split('_')
+        day_index = int(parts[1])
+        meal_index = int(parts[2])
+        
+        user_id = query.from_user.id
+        plan = get_latest_plan(user_id)
+        
+        if not plan or day_index >= len(plan.get('days', [])):
+            await query.edit_message_text(
+                "❌ Ошибка при загрузке приема пищи",
+                reply_markup=self.menu.get_week_days_menu()
+            )
+            return
+        
+        day = plan['days'][day_index]
+        if meal_index >= len(day.get('meals', [])):
+            await query.edit_message_text(
+                "❌ Ошибка при загрузке приема пищи",
+                reply_markup=self.menu.get_day_meals_menu(day_index)
+            )
+            return
+        
+        meal = day['meals'][meal_index]
+        meal_text = f"🍽 {meal['type']} - {day['name']}\n\n"
+        meal_text += f"🕐 Время: {meal['time']}\n"
+        meal_text += f"📝 Блюдо: {meal['name']}\n"
+        meal_text += f"🔥 Калорийность: {meal['calories']}\n"
+        meal_text += f"⏱ Время приготовления: {meal['cooking_time']}\n\n"
+        
+        meal_text += "📋 Ингредиенты:\n"
+        meal_text += f"{meal['ingredients']}\n\n"
+        
+        meal_text += "👩‍🍳 Приготовление:\n"
+        meal_text += f"{meal['instructions']}"
+        
+        await query.edit_message_text(
+            meal_text,
+            reply_markup=self.menu.get_meal_detail_menu(day_index, meal_index)
+        )
+    
+    async def _handle_next_meal(self, query, context, data):
+        """Обработчик перехода к следующему приему пищи"""
+        parts = data.split('_')
+        day_index = int(parts[2])
+        meal_index = int(parts[3])
+        
+        user_id = query.from_user.id
+        plan = get_latest_plan(user_id)
+        
+        if not plan:
+            await query.edit_message_text(
+                "❌ Ошибка при загрузке плана",
+                reply_markup=self.menu.get_main_menu()
+            )
+            return
+        
+        next_meal_index = meal_index + 1
+        next_day_index = day_index
+        
+        if next_meal_index >= len(plan['days'][day_index].get('meals', [])):
+            next_meal_index = 0
+            next_day_index += 1
+        
+        if next_day_index >= len(plan.get('days', [])):
+            next_day_index = 0
+        
+        next_callback = f"meal_{next_day_index}_{next_meal_index}"
+        await self._handle_meal_selection(query, context, next_callback)
+    
+    async def _handle_water_mode(self, query, context):
+        """Обработчик меню водного режима"""
+        await query.edit_message_text(
+            "💧 ВОДНЫЙ РЕЖИМ\n\n"
+            "Правильный питьевой режим - основа здоровья и эффективного похудения.\n\n"
+            "Выберите действие:",
+            reply_markup=self.menu.get_water_menu()
+        )
+    
+    async def _handle_water_recommendations(self, query, context):
+        """Обработчик рекомендаций по воде"""
+        user_id = query.from_user.id
+        plan = get_latest_plan(user_id)
+        
+        if plan and 'water_recommendation' in plan:
+            water_info = plan['water_recommendation']
+        else:
+            # Генерируем рекомендации на основе средних параметров
+            water_info = self.yandex_gpt._get_water_recommendation({'weight': 70, 'activity': 'СРЕДНЯЯ'})
+        
+        water_text = "💧 РЕКОМЕНДАЦИИ ПО ВОДНОМУ РЕЖИМУ\n\n"
+        water_text += f"📊 Ежедневная норма: {water_info['daily_recommendation']}\n"
+        water_text += f"📝 {water_info['description']}\n\n"
+        
+        water_text += "💡 Советы по потреблению воды:\n"
+        for tip in water_info['tips']:
+            water_text += f"{tip}\n"
+        
+        water_text += "\n🚰 Лучшее время для питья воды:\n"
+        water_text += "• Утром натощак - 1-2 стакана\n• За 30 минут до еды\n• Через 1-2 часа после еды\n• Во время тренировок\n• При чувстве голода\n"
+        
+        await query.edit_message_text(
+            water_text,
+            reply_markup=self.menu.get_water_menu()
+        )
+    
+    async def _handle_water_reminders(self, query, context):
+        """Обработчик напоминаний о воде"""
+        reminder_text = "⏱ НАСТРОЙКА НАПОМИНАНИЙ О ВОДЕ\n\n"
+        reminder_text += "Для настройки напоминаний:\n\n"
+        reminder_text += "1. Установите будильники на телефоне:\n"
+        reminder_text += "   • 08:00 - 2 стакана\n"
+        reminder_text += "   • 11:00 - 1 стакан\n"
+        reminder_text += "   • 14:00 - 1 стакан\n"
+        reminder_text += "   • 17:00 - 1 стакан\n"
+        reminder_text += "   • 20:00 - 1 стакан\n\n"
+        reminder_text += "2. Используйте приложения:\n"
+        reminder_text += "   • Water Drink Reminder\n"
+        reminder_text += "   • Hydro Coach\n"
+        reminder_text += "   • Plant Nanny\n\n"
+        reminder_text += "3. Держите воду всегда на виду\n"
+        
+        await query.edit_message_text(
+            reminder_text,
+            reply_markup=self.menu.get_water_menu()
+        )
+    
+    async def _handle_water_stats(self, query, context):
+        """Обработчик статистики воды"""
+        stats_text = "📊 СТАТИСТИКА ПОТРЕБЛЕНИЯ ВОДЫ\n\n"
+        stats_text += "💧 Польза достаточного потребления воды:\n"
+        stats_text += "• Ускоряет метаболизм на 20-30%\n"
+        stats_text += "• Снижает аппетит\n"
+        stats_text += "• Улучшает состояние кожи\n"
+        stats_text += "• Повышает энергию\n"
+        stats_text += "• Улучшает работу мозга\n\n"
+        stats_text += "📈 Ваши потенциальные результаты:\n"
+        stats_text += "• +20% к скорости похудения\n"
+        stats_text += "• -30% к усталости\n"
+        stats_text += "• +15% к продуктивности\n"
+        
+        await query.edit_message_text(
+            stats_text,
+            reply_markup=self.menu.get_water_menu()
+        )
     
     async def _handle_shopping_cart(self, query, context, page=0):
+        """Обработчик корзины покупок"""
         user_id = query.from_user.id
         items = get_shopping_cart(user_id)
         
@@ -1009,33 +1588,183 @@ class NutritionBot:
                 items = get_shopping_cart(user_id)
         
         if not items:
-            await query.edit_message_text("🛒 Корзина пуста", reply_markup=self.menu.get_main_menu())
+            await query.edit_message_text(
+                "🛒 Ваша корзина покупок пуста\n\n"
+                "Создайте план питания, чтобы автоматически заполнить корзину",
+                reply_markup=self.menu.get_main_menu()
+            )
             return
         
-        cart_text = "🛒 КОРЗИНА ПОКУПОК\n\nНажмите на продукт для отметки:\n\n"
-        for i, item in enumerate(items, 1):
+        cart_text = "🛒 КОРЗИНА ПОКУПОК\n\n"
+        cart_text += "✅ - куплено, ⬜ - нужно купить\n\n"
+        cart_text += "Нажмите на продукт, чтобы отметить его:\n\n"
+        
+        items_per_page = 10
+        start_idx = page * items_per_page
+        end_idx = start_idx + items_per_page
+        current_items = items[start_idx:end_idx]
+        
+        for i, item in enumerate(current_items, start=start_idx + 1):
             item_id, ingredient, checked = item
             status = "✅" if checked else "⬜"
             cart_text += f"{i}. {status} {ingredient}\n"
         
-        await query.edit_message_text(cart_text, reply_markup=self.menu.get_shopping_cart_menu(items, page))
+        total_items = len(items)
+        checked_items = sum(1 for item in items if item[2])
+        cart_text += f"\n📊 Прогресс: {checked_items}/{total_items} куплено"
+        
+        if page > 0 or (page + 1) * items_per_page < total_items:
+            cart_text += f"\n📄 Страница {page + 1}"
+        
+        await query.edit_message_text(
+            cart_text,
+            reply_markup=self.menu.get_shopping_cart_menu(items, page)
+        )
+    
+    async def _handle_toggle_cart_item(self, query, context, data):
+        """Обработчик переключения статуса элемента корзины"""
+        item_id = int(data.split('_')[1])
+        user_id = query.from_user.id
+        
+        items = get_shopping_cart(user_id)
+        current_item = next((item for item in items if item[0] == item_id), None)
+        
+        if current_item:
+            new_checked = not current_item[2]
+            update_shopping_item(item_id, new_checked)
+            
+            page = context.user_data.get('cart_page', 0)
+            await self._handle_shopping_cart(query, context, page)
+    
+    async def _handle_cart_page(self, query, context, data):
+        """Обработчик смены страницы корзины"""
+        page = int(data.split('_')[2])
+        context.user_data['cart_page'] = page
+        await self._handle_shopping_cart(query, context, page)
+    
+    async def _handle_refresh_cart(self, query, context):
+        """Обработчик обновления корзины из плана"""
+        user_id = query.from_user.id
+        plan = get_latest_plan(user_id)
+        
+        if not plan:
+            await query.edit_message_text(
+                "❌ У вас нет активного плана питания",
+                reply_markup=self.menu.get_main_menu()
+            )
+            return
+        
+        self._generate_and_save_shopping_cart(user_id, plan)
+        await query.edit_message_text(
+            "✅ Корзина обновлена из текущего плана питания!",
+            reply_markup=self.menu.get_main_menu()
+        )
+    
+    async def _handle_clear_cart(self, query, context):
+        """Обработчик очистки корзины"""
+        user_id = query.from_user.id
+        clear_shopping_cart(user_id)
+        
+        await query.edit_message_text(
+            "✅ Корзина покупок очищена!",
+            reply_markup=self.menu.get_main_menu()
+        )
+    
+    async def _handle_download_shopping_list(self, query, context):
+        """Обработчик скачивания списка покупок"""
+        user_id = query.from_user.id
+        items = get_shopping_cart(user_id)
+        
+        if not items:
+            await query.edit_message_text(
+                "❌ Корзина покупок пуста",
+                reply_markup=self.menu.get_shopping_cart_menu([], 0)
+            )
+            return
+        
+        filename = f"shopping_list_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write("🛒 СПИСОК ПОКУПОК НА НЕДЕЛЮ\n\n")
+            f.write("📋 Продукты:\n\n")
+            
+            checked_count = 0
+            for i, item in enumerate(items, 1):
+                item_id, ingredient, checked = item
+                status = "[✅]" if checked else "[ ]"
+                f.write(f"{i}. {status} {ingredient}\n")
+                if checked:
+                    checked_count += 1
+            
+            f.write(f"\n📊 Прогресс: {checked_count}/{len(items)} куплено\n\n")
+            f.write("💡 Советы:\n")
+            f.write("• Покупайте свежие продукты\n• Проверяйте сроки годности\n")
+        
+        with open(filename, 'rb') as file:
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=file,
+                filename=f"Список_покупок_{user_id}.txt",
+                caption="📄 Ваш список покупок на неделю"
+            )
+        
+        await query.edit_message_text(
+            "✅ Список покупок отправлен в виде файла!",
+            reply_markup=self.menu.get_shopping_cart_menu(items, 0)
+        )
+        
+        import os
+        os.remove(filename)
     
     async def _handle_help(self, query, context):
+        """Обработчик помощи"""
         help_text = """
-🤖 СПРАВКА ПО БОТУ
+🤖 СПРАВКА ПО БОТУ ПИТАНИЯ
 
-📊 СОЗДАТЬ ПЛАН - персонализированный план питания
-📈 ЧЕК-ИН - отслеживание прогресса  
-📋 МОЙ ПЛАН - управление планом питания
-🛒 КОРЗИНА - список покупок с отметками
+📊 СОЗДАТЬ ПЛАН:
+• Персонализированный план питания на 7 дней
+• Учет пола, цели, активности и параметров
+• 1 план в 7 дней для обычных пользователей
+
+📈 ЧЕК-ИН:
+• Ежедневное отслеживание прогресса
+• Вес, обхват талии, самочувствие, сон
+• Просмотр истории и статистики
+
+📋 МОЙ ПЛАН:
+• Просмотр плана на неделю
+• Детали по дням и приемам пищи
+• Скачивание плана в текстовом файле
+
+🛒 КОРЗИНА:
+• Автоматический список покупок из плана
+• Отметка купленных продуктов галочками
+• Суммирование одинаковых продуктов
+• Скачивание списка в файл
+
+💧 ВОДНЫЙ РЕЖИМ:
+• Персональные рекомендации по воде
+• Советы по потреблению
+• Напоминания и статистика
+
+Для начала работы нажмите /start или выберите действие из меню.
 """
-        await query.edit_message_text(help_text, reply_markup=self.menu.get_main_menu())
+        await query.edit_message_text(
+            help_text,
+            reply_markup=self.menu.get_main_menu()
+        )
     
     async def _show_main_menu(self, query):
-        await query.edit_message_text("🤖 ГЛАВНОЕ МЕНЮ", reply_markup=self.menu.get_main_menu())
+        """Показывает главное меню"""
+        await query.edit_message_text(
+            "🤖 ГЛАВНОЕ МЕНЮ\n\nВыберите действие:",
+            reply_markup=self.menu.get_main_menu()
+        )
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик текстовых сообщений"""
         health_monitor.increment_request()
+        
         try:
             user_id = update.effective_user.id
             text = update.message.text
@@ -1048,21 +1777,35 @@ class NutritionBot:
                 elif input_type == 'checkin_data':
                     await self._process_checkin_data(update, context, text)
                 else:
-                    await update.message.reply_text("❌ Неизвестный тип ввода", reply_markup=self.menu.get_main_menu())
+                    await update.message.reply_text(
+                        "❌ Неизвестный тип ввода. Используйте /menu",
+                        reply_markup=self.menu.get_main_menu()
+                    )
                 
                 context.user_data.pop('awaiting_input', None)
             else:
-                await update.message.reply_text("🤖 Используйте меню", reply_markup=self.menu.get_main_menu())
+                await update.message.reply_text(
+                    "🤖 Используйте меню для навигации или /start для начала",
+                    reply_markup=self.menu.get_main_menu()
+                )
                 
         except Exception as e:
             health_monitor.increment_error()
-            await update.message.reply_text("❌ Ошибка", reply_markup=self.menu.get_main_menu())
+            logger.error(f"Error in message handler: {e}")
+            await update.message.reply_text(
+                "❌ Произошла ошибка. Попробуйте снова.",
+                reply_markup=self.menu.get_main_menu()
+            )
     
     async def _process_plan_details(self, update, context, text):
+        """Обрабатывает ввод деталей плана с Yandex GPT"""
         try:
             parts = [part.strip() for part in text.split(',')]
             if len(parts) != 3:
-                await update.message.reply_text("❌ Неверный формат. Пример: 30, 180, 75", reply_markup=self.menu.get_back_menu())
+                await update.message.reply_text(
+                    "❌ Неверный формат. Введите: Возраст, Рост (см), Вес (кг)\nПример: 30, 180, 75",
+                    reply_markup=self.menu.get_back_menu()
+                )
                 return
             
             age = int(parts[0])
@@ -1075,29 +1818,91 @@ class NutritionBot:
                 'weight': weight
             })
             
-            await update.message.reply_text("🔄 Создаем ваш план...")
+            await update.message.reply_text("🔄 Создаем ваш персональный план питания с помощью AI...")
             
             plan = self.yandex_gpt.generate_nutrition_plan(context.user_data['plan_data'])
             
             if plan:
                 plan_id = save_plan(update.effective_user.id, plan)
                 update_user_limit(update.effective_user.id)
+                
                 self._generate_and_save_shopping_cart(update.effective_user.id, plan)
                 
                 if plan_id:
-                    await update.message.reply_text("✅ План готов!", reply_markup=self.menu.get_main_menu())
+                    await update.message.reply_text(
+                        "✅ Ваш персональный план питания готов!\n\n"
+                        "🛒 Корзина покупок автоматически заполнена\n"
+                        "💧 Добавлены рекомендации по водному режиму\n"
+                        "🤖 План создан с помощью Yandex GPT AI\n\n"
+                        "Используйте меню для просмотра деталей.",
+                        reply_markup=self.menu.get_main_menu()
+                    )
                 else:
-                    await update.message.reply_text("❌ Ошибка сохранения", reply_markup=self.menu.get_main_menu())
+                    await update.message.reply_text(
+                        "❌ Ошибка при сохранении плана",
+                        reply_markup=self.menu.get_main_menu()
+                    )
             else:
-                await update.message.reply_text("❌ Ошибка создания", reply_markup=self.menu.get_main_menu())
+                await update.message.reply_text(
+                    "❌ Не удалось создать план. Попробуйте позже.",
+                    reply_markup=self.menu.get_main_menu()
+                )
             
         except ValueError:
-            await update.message.reply_text("❌ Неверный формат чисел", reply_markup=self.menu.get_back_menu())
+            await update.message.reply_text(
+                "❌ Неверный формат чисел. Убедитесь, что вводите числа правильно.\nПример: 30, 180, 75",
+                reply_markup=self.menu.get_back_menu()
+            )
         except Exception as e:
             health_monitor.increment_error()
-            await update.message.reply_text("❌ Ошибка", reply_markup=self.menu.get_main_menu())
+            logger.error(f"Error processing plan details: {e}")
+            await update.message.reply_text(
+                "❌ Ошибка при обработке данных. Попробуйте снова.",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
+    async def _process_checkin_data(self, update, context, text):
+        """Обрабатывает ввод данных чек-ина"""
+        try:
+            parts = [part.strip() for part in text.split(',')]
+            if len(parts) != 4:
+                await update.message.reply_text(
+                    "❌ Неверный формат. Введите: Вес, Талия, Самочувствие, Сон\nПример: 75.5, 85, 4, 3"
+                )
+                return
+            
+            weight = float(parts[0])
+            waist = int(parts[1])
+            wellbeing = int(parts[2])
+            sleep = int(parts[3])
+            
+            if not (1 <= wellbeing <= 5) or not (1 <= sleep <= 5):
+                await update.message.reply_text(
+                    "❌ Оценки должны быть от 1 до 5\nПример: 75.5, 85, 4, 3"
+                )
+                return
+            
+            save_checkin(update.effective_user.id, weight, waist, wellbeing, sleep)
+            
+            await update.message.reply_text(
+                "✅ Данные чек-ина сохранены!\n\n"
+                "Продолжайте отслеживать свой прогресс 💪",
+                reply_markup=self.menu.get_checkin_menu()
+            )
+            
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Неверный формат чисел. Убедитесь, что вводите числа правильно.\nПример: 75.5, 85, 4, 3"
+            )
+        except Exception as e:
+            health_monitor.increment_error()
+            await update.message.reply_text(
+                "❌ Ошибка при сохранении данных. Попробуйте снова.",
+                reply_markup=self.menu.get_main_menu()
+            )
     
     def _generate_and_save_shopping_cart(self, user_id, plan):
+        """Генерирует и сохраняет корзину покупок из плана с СУММИРОВАНИЕМ продуктов"""
         try:
             shopping_list = self._generate_shopping_list(plan)
             save_shopping_cart(user_id, shopping_list)
@@ -1105,43 +1910,234 @@ class NutritionBot:
             logger.error(f"Error generating shopping cart: {e}")
     
     def _generate_shopping_list(self, plan):
+        """Генерирует список покупок на основе плана с СУММИРОВАНИЕМ одинаковых продуктов"""
         try:
+            # Собираем все ингредиенты из всех приемов пищи за неделю
             all_ingredients = []
+            
             for day in plan.get('days', []):
                 for meal in day.get('meals', []):
                     ingredients = meal.get('ingredients', '')
                     lines = ingredients.split('\n')
                     for line in lines:
                         line = line.strip()
-                        if line and (line.startswith('•') or line.startswith('-')):
-                            clean_line = re.sub(r'^[•\-\s]+', '', line).strip()
+                        if line and (line.startswith('•') or line.startswith('-') or line[0].isdigit()):
+                            clean_line = re.sub(r'^[•\-\d\.\s]+', '', line).strip()
                             if clean_line:
                                 all_ingredients.append(clean_line)
             
-            unique_ingredients = sorted(list(set(all_ingredients)))
-            return unique_ingredients[:20] if unique_ingredients else ["Куриная грудка - 500г", "Овощи - 1кг", "Фрукты - 500г"]
+            # Суммируем одинаковые продукты
+            ingredient_totals = {}
+            for ingredient in all_ingredients:
+                # Извлекаем название продукта и количество
+                match = re.match(r'(.+?)\s*-\s*(\d+\.?\d*)\s*([гкгмлл]?)', ingredient)
+                if match:
+                    name = match.group(1).strip()
+                    amount = float(match.group(2))
+                    unit = match.group(3) if match.group(3) else 'г'
+                    
+                    key = f"{name} ({unit})"
+                    if key in ingredient_totals:
+                        ingredient_totals[key] += amount
+                    else:
+                        ingredient_totals[key] = amount
+                else:
+                    # Если не удалось распарсить, просто добавляем как есть
+                    if ingredient in ingredient_totals:
+                        ingredient_totals[ingredient] += 1
+                    else:
+                        ingredient_totals[ingredient] = 1
+            
+            # Форматируем результат
+            formatted_ingredients = []
+            for ingredient, total in ingredient_totals.items():
+                if total == int(total):
+                    total = int(total)
+                formatted_ingredients.append(f"{ingredient.split(' (')[0]} - {total}{ingredient.split('(')[-1].rstrip(')') if '(' in ingredient else 'шт'}")
+            
+            # Сортируем по алфавиту
+            formatted_ingredients.sort()
+            
+            if not formatted_ingredients:
+                # Демо-данные, если не удалось извлечь ингредиенты
+                return [
+                    "Куриная грудка - 700г",
+                    "Рыба белая - 600г", 
+                    "Овощи сезонные - 2000г",
+                    "Фрукты - 1500г",
+                    "Крупы - 1000г",
+                    "Яйца - 10шт",
+                    "Молочные продукты - 1000г",
+                    "Оливковое масло - 200мл",
+                    "Специи - по вкусу"
+                ]
+            
+            return formatted_ingredients[:25]  # Ограничиваем список
             
         except Exception as e:
-            return ["Куриная грудка - 500г", "Овощи - 1кг", "Фрукты - 500г"]
+            logger.error(f"Error generating shopping list: {e}")
+            return [
+                "Куриная грудка - 700г",
+                "Рыба белая - 600г",
+                "Овощи сезонные - 2000г",
+                "Фрукты - 1500г",
+                "Крупы - 1000г"
+            ]
+    
+    async def send_plan_as_file(self, update, context, user_id):
+        """Отправляет план в виде файла"""
+        try:
+            plan = get_latest_plan(user_id)
+            if not plan:
+                if hasattr(update, 'message'):
+                    await update.message.reply_text("❌ У вас нет активного плана питания")
+                else:
+                    await update.edit_message_text("❌ У вас нет активного плана питания")
+                return
+            
+            filename = f"nutrition_plan_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("🍎 ПЕРСОНАЛЬНЫЙ ПЛАН ПИТАНИЯ\n")
+                f.write("=" * 50 + "\n\n")
+                
+                user_data = plan.get('user_data', {})
+                f.write("👤 ВАШИ ДАННЫЕ:\n")
+                f.write(f"   Пол: {user_data.get('gender', '')}\n")
+                f.write(f"   Возраст: {user_data.get('age', '')} лет\n")
+                f.write(f"   Рост: {user_data.get('height', '')} см\n")
+                f.write(f"   Вес: {user_data.get('weight', '')} кг\n")
+                f.write(f"   Цель: {user_data.get('goal', '')}\n")
+                f.write(f"   Активность: {user_data.get('activity', '')}\n\n")
+                
+                # Рекомендации по воде
+                if 'water_recommendation' in plan:
+                    water = plan['water_recommendation']
+                    f.write("💧 РЕКОМЕНДАЦИИ ПО ВОДЕ:\n")
+                    f.write(f"   Ежедневная норма: {water.get('daily_recommendation', '2000 мл')}\n")
+                    f.write(f"   {water.get('description', '')}\n\n")
+                    f.write("   Советы:\n")
+                    for tip in water.get('tips', []):
+                        f.write(f"   {tip}\n")
+                    f.write("\n")
+                
+                # Список покупок
+                f.write("🛒 СПИСОК ПОКУПОК НА НЕДЕЛЮ:\n")
+                f.write("-" * 40 + "\n")
+                shopping_list = self._generate_shopping_list(plan)
+                for i, item in enumerate(shopping_list, 1):
+                    f.write(f"{i}. {item}\n")
+                f.write("\n")
+                
+                # План на неделю
+                f.write("📅 ПЛАН ПИТАНИЯ НА НЕДЕЛЮ:\n")
+                f.write("=" * 50 + "\n\n")
+                
+                for day in plan.get('days', []):
+                    f.write(f"=== {day['name']} ===\n")
+                    f.write(f"🔥 Общая калорийность: {day.get('total_calories', '~1800-2000 ккал')}\n\n")
+                    
+                    for meal in day.get('meals', []):
+                        f.write(f"{meal['emoji']} {meal['type']} ({meal['time']})\n")
+                        f.write(f"   Блюдо: {meal['name']}\n")
+                        f.write(f"   Калории: {meal['calories']}\n")
+                        f.write(f"   Время приготовления: {meal['cooking_time']}\n")
+                        f.write("   Ингредиенты:\n")
+                        ingredients_lines = meal['ingredients'].split('\n')
+                        for line in ingredients_lines:
+                            f.write(f"     {line}\n")
+                        f.write("   Приготовление:\n")
+                        instructions_lines = meal['instructions'].split('\n')
+                        for line in instructions_lines:
+                            f.write(f"     {line}\n")
+                        f.write("-" * 40 + "\n\n")
+                
+                f.write("\n💡 СОВЕТЫ:\n")
+                f.write("• Пейте достаточное количество воды\n")
+                f.write("• Соблюдайте режим питания\n")
+                f.write("• Используйте корзину покупок для отслеживания\n\n")
+                
+                f.write(f"📅 План создан: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n")
+            
+            with open(filename, 'rb') as file:
+                if hasattr(update, 'message'):
+                    await update.message.reply_document(
+                        document=file,
+                        filename=f"План_питания_{user_id}.txt",
+                        caption="📄 Ваш персональный план питания со списком покупок"
+                    )
+                else:
+                    await context.bot.send_document(
+                        chat_id=user_id,
+                        document=file,
+                        filename=f"План_питания_{user_id}.txt",
+                        caption="📄 Ваш персональный план питания со списком покупок"
+                    )
+            
+            import os
+            os.remove(filename)
+            
+            if not hasattr(update, 'message'):
+                await update.edit_message_text("✅ План отправлен в виде файла!")
+                
+        except Exception as e:
+            logger.error(f"Error sending plan as file: {e}")
+            if hasattr(update, 'message'):
+                await update.message.reply_text("❌ Ошибка при создании файла плана")
+            else:
+                await update.edit_message_text("❌ Ошибка при создании файла плана")
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик ошибок"""
         health_monitor.increment_error()
-        logger.error(f"Error: {context.error}")
+        logger.error(f"Exception while handling an update: {context.error}")
+        
+        try:
+            if update and update.effective_message:
+                await update.effective_message.reply_text(
+                    "❌ Произошла непредвиденная ошибка. Попробуйте позже.",
+                    reply_markup=self.menu.get_main_menu()
+                )
+        except Exception as e:
+            logger.error(f"Error in error handler: {e}")
 
-# ==================== ЗАПУСК ====================
+# ==================== ЗАПУСК ПРИЛОЖЕНИЯ ====================
 
 def run_health_checks():
-    logger.info("🔍 Running health checks...")
-    check_database_health()
-    check_telegram_api_health()
-    check_yandex_gpt_health()
+    """Запускает начальные проверки здоровья"""
+    logger.info("🔍 Running initial health checks...")
+    
+    # Сначала инициализируем базу данных
+    init_database()
+    
+    # Затем проверяем здоровье
+    if check_database_health():
+        logger.info("✅ Database health check passed")
+    else:
+        logger.error("❌ Database health check failed")
+    
+    if check_telegram_api_health():
+        logger.info("✅ Telegram API health check passed")
+    else:
+        logger.error("❌ Telegram API health check failed")
+    
+    if check_yandex_gpt_health():
+        logger.info("✅ Yandex GPT health check passed")
+    else:
+        logger.warning("⚠️ Yandex GPT health check failed or not configured")
 
 def run_webhook():
+    """Запускает бота с webhook"""
     try:
         global bot_instance
+        
+        # Запускаем начальные проверки
         run_health_checks()
+        
+        # Инициализируем бота
         bot_instance = NutritionBot()
         
+        # Настраиваем webhook
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         bot_instance.application.run_webhook(
             listen="0.0.0.0",
@@ -1154,13 +2150,14 @@ def run_webhook():
         health_monitor.update_bot_status("running")
         
     except Exception as e:
-        logger.error(f"❌ Failed to start bot: {e}")
+        health_monitor.update_bot_status("error")
+        logger.error(f"❌ Failed to start webhook bot: {e}")
 
 if __name__ == '__main__':
     if RENDER_EXTERNAL_URL:
-        logger.info("🚀 Starting in WEBHOOK mode")
+        logger.info("🚀 Starting in WEBHOOK mode for Render")
         run_webhook()
     else:
-        logger.info("🔄 Starting in POLLING mode")
+        logger.info("🔄 Starting in POLLING mode for local development")
         # Для простоты в этом примере только webhook
         print("Для локальной разработки настройте RENDER_EXTERNAL_URL")
