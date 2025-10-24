@@ -1,17 +1,20 @@
 import os
 import logging
-import asyncio
+import threading
+import time
 import sqlite3
 import json
-import httpx
+import requests
 import signal
+import atexit
+import socket
 import sys
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, jsonify, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
-from telegram.error import TelegramError, Conflict
+from telegram.error import TelegramError
 
 # Настройка логирования
 logging.basicConfig(
@@ -19,9 +22,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# Flask приложение
-app = Flask(__name__)
 
 # ==================== КОНФИГУРАЦИЯ ====================
 
@@ -82,55 +82,6 @@ class HealthMonitor:
 
 # Глобальный монитор здоровья
 health_monitor = HealthMonitor()
-
-# Глобальная переменная для бота
-bot_application = None
-
-# ==================== FLASK ROUTES ====================
-
-@app.route('/')
-def home():
-    """Корневой endpoint для проверки работоспособности"""
-    return jsonify({
-        "status": "🤖 Nutrition Bot is running", 
-        "service": "Telegram Nutrition AI Bot",
-        "webhook": f"{RENDER_EXTERNAL_URL}/webhook",
-        "health": health_monitor.get_stats(),
-        "timestamp": datetime.now().isoformat()
-    })
-
-@app.route('/health')
-def health_check():
-    """Endpoint для проверки здоровья сервиса"""
-    return jsonify(health_monitor.get_stats())
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Endpoint для webhook Telegram"""
-    global bot_application
-    
-    if bot_application:
-        try:
-            # Обрабатываем update через PTB
-            update = Update.de_json(request.get_json(), bot_application.bot)
-            asyncio.create_task(
-                process_telegram_update(update)
-            )
-            return 'ok'
-        except Exception as e:
-            logger.error(f"Error processing webhook: {e}")
-            return 'error', 500
-    else:
-        logger.error("Bot application not initialized")
-        return 'bot not initialized', 500
-
-async def process_telegram_update(update: Update):
-    """Асинхронная обработка Telegram update"""
-    global bot_application
-    try:
-        await bot_application.process_update(update)
-    except Exception as e:
-        logger.error(f"Error processing telegram update: {e}")
 
 # ==================== БАЗА ДАННЫХ ====================
 
@@ -444,7 +395,7 @@ def clear_shopping_cart(user_id):
     finally:
         conn.close()
 
-async def check_database_health():
+def check_database_health():
     """Проверяет здоровье базы данных"""
     try:
         conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
@@ -471,23 +422,22 @@ async def check_database_health():
         logger.error(f"❌ Database health check failed: {e}")
         return False
 
-async def check_telegram_api_health():
+def check_telegram_api_health():
     """Проверяет доступность Telegram API"""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f'https://api.telegram.org/bot{BOT_TOKEN}/getMe')
-            if response.status_code == 200:
-                health_monitor.update_telegram_status("healthy")
-                return True
-            else:
-                health_monitor.update_telegram_status("error")
-                return False
+        response = requests.get(f'https://api.telegram.org/bot{BOT_TOKEN}/getMe', timeout=10)
+        if response.status_code == 200:
+            health_monitor.update_telegram_status("healthy")
+            return True
+        else:
+            health_monitor.update_telegram_status("error")
+            return False
     except Exception as e:
         health_monitor.update_telegram_status("error")
         logger.error(f"❌ Telegram API health check failed: {e}")
         return False
 
-async def check_yandex_gpt_health():
+def check_yandex_gpt_health():
     """Проверяет доступность Yandex GPT API"""
     try:
         if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
@@ -514,15 +464,14 @@ async def check_yandex_gpt_health():
             ]
         }
         
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(YANDEX_GPT_URL, headers=headers, json=data)
-            if response.status_code == 200:
-                health_monitor.update_yandex_gpt_status("healthy")
-                return True
-            else:
-                health_monitor.update_yandex_gpt_status("error")
-                return False
-                
+        response = requests.post(YANDEX_GPT_URL, headers=headers, json=data, timeout=15)
+        if response.status_code == 200:
+            health_monitor.update_yandex_gpt_status("healthy")
+            return True
+        else:
+            health_monitor.update_yandex_gpt_status("error")
+            return False
+            
     except Exception as e:
         health_monitor.update_yandex_gpt_status("error")
         logger.error(f"❌ Yandex GPT health check failed: {e}")
@@ -536,7 +485,7 @@ class YandexGPT:
         self.folder_id = YANDEX_FOLDER_ID
         self.url = YANDEX_GPT_URL
     
-    async def generate_nutrition_plan(self, user_data):
+    def generate_nutrition_plan(self, user_data):
         """Генерирует план питания через Yandex GPT"""
         try:
             if not self.api_key or not self.folder_id:
@@ -560,7 +509,7 @@ class YandexGPT:
                 "messages": [
                     {
                         "role": "system",
-                        "text": """Ты - профессор нутрициологии со стажем 20 лет. Создай персонализированный план питания на 7 дней. 
+                        "text": """Ты - профессиональный диетолог. Создай персонализированный план питания на 7 дней. 
 Включи рекомендации по потреблению воды. Формат строго JSON."""
                     },
                     {
@@ -570,29 +519,28 @@ class YandexGPT:
                 ]
             }
             
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(self.url, headers=headers, json=data)
+            response = requests.post(self.url, headers=headers, json=data, timeout=30)
+            
+            if response.status_code == 200:
+                result = response.json()
+                plan_text = result['result']['alternatives'][0]['message']['text']
                 
-                if response.status_code == 200:
-                    result = response.json()
-                    plan_text = result['result']['alternatives'][0]['message']['text']
+                json_match = re.search(r'\{.*\}', plan_text, re.DOTALL)
+                if json_match:
+                    plan_json = json.loads(json_match.group())
+                    plan_json['user_data'] = user_data
                     
-                    json_match = re.search(r'\{.*\}', plan_text, re.DOTALL)
-                    if json_match:
-                        plan_json = json.loads(json_match.group())
-                        plan_json['user_data'] = user_data
-                        
-                        # Добавляем рекомендации по воде если их нет
-                        if 'water_recommendation' not in plan_json:
-                            plan_json['water_recommendation'] = self._get_water_recommendation(user_data)
-                        
-                        return plan_json
-                    else:
-                        logger.error("No JSON found in GPT response")
-                        return self._generate_demo_plan(user_data)
+                    # Добавляем рекомендации по воде если их нет
+                    if 'water_recommendation' not in plan_json:
+                        plan_json['water_recommendation'] = self._get_water_recommendation(user_data)
+                    
+                    return plan_json
                 else:
-                    logger.error(f"Yandex GPT API error: {response.status_code}")
+                    logger.error("No JSON found in GPT response")
                     return self._generate_demo_plan(user_data)
+            else:
+                logger.error(f"Yandex GPT API error: {response.status_code}")
+                return self._generate_demo_plan(user_data)
                 
         except Exception as e:
             logger.error(f"Error generating plan with Yandex GPT: {e}")
@@ -617,21 +565,19 @@ class YandexGPT:
 Цель: {goal}
 Уровень активности: {activity}
 
-Требования как профессора нутрициологии:
-- Научно обоснованные рекомендации по питанию
-- Сбалансированное соотношение БЖУ (белков, жиров, углеводов)
-- Учет биоритмов и метаболических процессов
-- Индивидуальный подход к нутрициологическим потребностям
+Требования:
+- Разнообразные блюда каждый день
 - Практичные рецепты с доступными ингредиентами
-- Учет цели {goal} с научной точки зрения
-- 5 приемов пищи в день с оптимальными интервалами
-- Указание нутриентного состава для каждого приема пищи
-- Список ингредиентов с точными количествами
-- Пошаговые инструкции приготовления с сохранением нутриентов
+- Сбалансированное питание
+- Учет цели {goal}
+- 5 приемов пищи в день
+- Указание калорийности для каждого приема пищи
+- Список ингредиентов с количествами
+- Пошаговые инструкции приготовления
 - Время приготовления
-- Рекомендации по гидратации на основе метаболических потребностей
+- Рекомендации по потреблению воды
 
-Верни ответ ТОЛЬКО в format JSON без дополнительного текста.
+Верни ответ ТОЛЬКО в формате JSON без дополнительного текста.
 """
         return prompt
     
@@ -876,7 +822,7 @@ class InteractiveMenu:
             [InlineKeyboardButton("🔄 ОБНОВИТЬ СПИСОК ИЗ ПЛАНА", callback_data="refresh_cart")],
             [InlineKeyboardButton("🧹 ОЧИСТИТЬ КОРЗИНУ", callback_data="clear_cart")],
             [InlineKeyboardButton("📄 СКАЧАТЬ СПИСОК", callback_data="download_shopping_list")],
-            [InlineKeyboardButton("↩️ НАЗАД В МЕНУ", callback_data="back_main")]
+            [InlineKeyboardButton("↩️ НАЗАД В МЕНЮ", callback_data="back_main")]
         ])
         
         return InlineKeyboardMarkup(keyboard)
@@ -887,6 +833,84 @@ class InteractiveMenu:
             [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_main")]
         ]
         return InlineKeyboardMarkup(keyboard)
+
+# ==================== FLASK APP ====================
+
+app = Flask(__name__)
+bot_instance = None
+
+@app.route('/')
+def home():
+    health_monitor.increment_request()
+    stats = health_monitor.get_stats()
+    status_emoji = "✅" if health_monitor.bot_status == "healthy" else "❌"
+    
+    return f"""
+    <h1>🤖 Nutrition Bot Status {status_emoji}</h1>
+    <p>Бот для создания персональных планов питания</p>
+    <p><strong>Uptime:</strong> {stats['uptime_seconds']} seconds</p>
+    <p><strong>Status:</strong> {health_monitor.bot_status.upper()}</p>
+    <p><strong>Requests:</strong> {stats['request_count']}</p>
+    <p><a href="/health">Health Check</a> | <a href="/ping">Ping</a> | <a href="/wakeup">Wakeup</a></p>
+    <p>🕒 Last update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    """
+
+@app.route('/health')
+def health_check():
+    health_monitor.increment_request()
+    
+    db_healthy = check_database_health()
+    telegram_healthy = check_telegram_api_health()
+    yandex_healthy = check_yandex_gpt_health()
+    
+    all_healthy = db_healthy and telegram_healthy and (yandex_healthy or health_monitor.yandex_gpt_status == "not_configured")
+    
+    if all_healthy:
+        health_monitor.update_bot_status("healthy")
+        status_code = 200
+    else:
+        health_monitor.update_bot_status("degraded")
+        status_code = 503
+    
+    response = {
+        "status": "healthy" if all_healthy else "degraded",
+        "timestamp": datetime.now().isoformat(),
+        "service": "nutrition-bot",
+        "version": "2.0",
+        "checks": {
+            "database": health_monitor.db_status,
+            "telegram_api": health_monitor.telegram_api_status,
+            "yandex_gpt": health_monitor.yandex_gpt_status
+        },
+        "stats": health_monitor.get_stats()
+    }
+    
+    return jsonify(response), status_code
+
+@app.route('/ping')
+def ping():
+    health_monitor.increment_request()
+    return jsonify({"status": "pong", "timestamp": datetime.now().isoformat()})
+
+@app.route('/wakeup')
+def wakeup():
+    health_monitor.increment_request()
+    check_database_health()
+    check_telegram_api_health()
+    return jsonify({"status": "awake", "timestamp": datetime.now().isoformat()})
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    health_monitor.increment_request()
+    if bot_instance and bot_instance.application:
+        try:
+            update = Update.de_json(request.get_json(), bot_instance.application.bot)
+            bot_instance.application.update_queue.put(update)
+            return 'OK'
+        except Exception as e:
+            health_monitor.increment_error()
+            return 'ERROR', 500
+    return 'BOT_NOT_READY', 503
 
 # ==================== ОСНОВНОЙ КЛАСС БОТА ====================
 
@@ -916,7 +940,7 @@ class NutritionBot:
             raise
     
     def _setup_handlers(self):
-        """Настройка обработчиков"""
+        """Настройка обработчиков - ВСЕ методы должны быть реализованы"""
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("menu", self.menu_command))
         self.application.add_handler(CommandHandler("dbstats", self.dbstats_command))
@@ -1006,8 +1030,8 @@ class NutritionBot:
         """Команда для пробуждения бота"""
         health_monitor.increment_request()
         
-        await check_database_health()
-        await check_telegram_api_health()
+        check_database_health()
+        check_telegram_api_health()
         
         await update.message.reply_text("🤖 Бот активен и работает! ✅")
     
@@ -1027,8 +1051,6 @@ class NutritionBot:
             
             welcome_text = """
 🎯 Добро пожаловать в бот персонализированного питания с AI!
-
-🤵 Ваш виртуальный профессор нутрициологии с 20-летним стажем создаст для вас научно обоснованный план питания.
 
 Выберите действие из меню ниже:
 """
@@ -1798,7 +1820,7 @@ class NutritionBot:
             
             await update.message.reply_text("🔄 Создаем ваш персональный план питания с помощью AI...")
             
-            plan = await self.yandex_gpt.generate_nutrition_plan(context.user_data['plan_data'])
+            plan = self.yandex_gpt.generate_nutrition_plan(context.user_data['plan_data'])
             
             if plan:
                 plan_id = save_plan(update.effective_user.id, plan)
@@ -1811,7 +1833,7 @@ class NutritionBot:
                         "✅ Ваш персональный план питания готов!\n\n"
                         "🛒 Корзина покупок автоматически заполнена\n"
                         "💧 Добавлены рекомендации по водному режиму\n"
-                        "🎓 План создан с учетом принципов нутрициологии\n\n"
+                        "🤖 План создан с помощью Yandex GPT AI\n\n"
                         "Используйте меню для просмотра деталей.",
                         reply_markup=self.menu.get_main_menu()
                     )
@@ -2068,13 +2090,6 @@ class NutritionBot:
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ошибок"""
         health_monitor.increment_error()
-        
-        # ИГНОРИРУЕМ КОНФЛИКТНЫЕ ОШИБКИ WEBHOOK
-        if (isinstance(context.error, Conflict) and 
-            "webhook is active" in str(context.error)):
-            logger.warning("⚠️ Webhook conflict error (ignored)")
-            return
-            
         logger.error(f"Exception while handling an update: {context.error}")
         
         try:
@@ -2088,45 +2103,61 @@ class NutritionBot:
 
 # ==================== ЗАПУСК ПРИЛОЖЕНИЯ ====================
 
-def setup_sync():
-    """Синхронная настройка бота"""
-    global bot_application
+def run_health_checks():
+    """Запускает начальные проверки здоровья"""
+    logger.info("🔍 Running initial health checks...")
     
+    # Сначала инициализируем базу данных
+    init_database()
+    
+    # Затем проверяем здоровье
+    if check_database_health():
+        logger.info("✅ Database health check passed")
+    else:
+        logger.error("❌ Database health check failed")
+    
+    if check_telegram_api_health():
+        logger.info("✅ Telegram API health check passed")
+    else:
+        logger.error("❌ Telegram API health check failed")
+    
+    if check_yandex_gpt_health():
+        logger.info("✅ Yandex GPT health check passed")
+    else:
+        logger.warning("⚠️ Yandex GPT health check failed or not configured")
+
+def run_webhook():
+    """Запускает бота с webhook"""
     try:
-        # Инициализируем базу данных
-        init_database()
+        global bot_instance
         
-        # Создаем бота
-        bot = NutritionBot()
-        bot_application = bot.application
+        # Запускаем начальные проверки
+        run_health_checks()
+        
+        # Инициализируем бота
+        bot_instance = NutritionBot()
         
         # Настраиваем webhook
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+        bot_instance.application.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.environ.get('PORT', 5000)),
+            url_path=BOT_TOKEN,
+            webhook_url=webhook_url
+        )
         
-        # Синхронный запуск асинхронных функций
-        import asyncio
-        asyncio.run(bot_application.initialize())
-        asyncio.run(bot_application.start())
-        asyncio.run(bot_application.bot.set_webhook(
-            url=webhook_url,
-            drop_pending_updates=True
-        ))
-        
-        logger.info(f"✅ Webhook configured: {webhook_url}")
+        logger.info(f"✅ Webhook bot started on {webhook_url}")
         health_monitor.update_bot_status("running")
-        return True
         
     except Exception as e:
-        logger.error(f"❌ Setup failed: {e}")
-        return False
+        health_monitor.update_bot_status("error")
+        logger.error(f"❌ Failed to start webhook bot: {e}")
 
 if __name__ == '__main__':
-    # Настраиваем бота
-    logger.info("🚀 Starting application...")
-    if setup_sync():
-        # Запускаем Flask
-        port = int(os.environ.get('PORT', 8080))
-        logger.info(f"🔌 Starting Flask on port {port}")
-        app.run(host='0.0.0.0', port=port, debug=False)
+    if RENDER_EXTERNAL_URL:
+        logger.info("🚀 Starting in WEBHOOK mode for Render")
+        run_webhook()
     else:
-        logger.error("❌ Failed to start application")
+        logger.info("🔄 Starting in POLLING mode for local development")
+        # Для простоты в этом примере только webhook
+        print("Для локальной разработки настройте RENDER_EXTERNAL_URL")
