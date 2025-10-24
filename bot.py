@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
-from telegram.error import TelegramError
+from telegram.error import TelegramError, Conflict
 
 # Настройка логирования
 logging.basicConfig(
@@ -822,7 +822,7 @@ class InteractiveMenu:
             [InlineKeyboardButton("🔄 ОБНОВИТЬ СПИСОК ИЗ ПЛАНА", callback_data="refresh_cart")],
             [InlineKeyboardButton("🧹 ОЧИСТИТЬ КОРЗИНУ", callback_data="clear_cart")],
             [InlineKeyboardButton("📄 СКАЧАТЬ СПИСОК", callback_data="download_shopping_list")],
-            [InlineKeyboardButton("↩️ НАЗАД В МЕНЮ", callback_data="back_main")]
+            [InlineKeyboardButton("↩️ НАЗАД В МЕНУ", callback_data="back_main")]
         ])
         
         return InlineKeyboardMarkup(keyboard)
@@ -901,16 +901,56 @@ def wakeup():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    """Обработчик webhook от Telegram"""
     health_monitor.increment_request()
     if bot_instance and bot_instance.application:
         try:
-            update = Update.de_json(request.get_json(), bot_instance.application.bot)
-            bot_instance.application.update_queue.put(update)
+            # Парсим обновление от Telegram
+            update_data = request.get_json()
+            if not update_data:
+                return 'EMPTY_UPDATE', 400
+                
+            update = Update.de_json(update_data, bot_instance.application.bot)
+            
+            # Обрабатываем обновление через Application
+            bot_instance.application.process_update(update)
             return 'OK'
+            
         except Exception as e:
             health_monitor.increment_error()
+            logger.error(f"Webhook processing error: {e}")
             return 'ERROR', 500
-    return 'BOT_NOT_READY', 503
+    else:
+        logger.error("Bot instance not ready")
+        return 'BOT_NOT_READY', 503
+
+@app.route('/set_webhook', methods=['GET'])
+def set_webhook():
+    """Ручная установка webhook (для отладки)"""
+    if not bot_instance:
+        return "Bot not initialized", 503
+        
+    webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+    try:
+        result = bot_instance.application.bot.set_webhook(
+            url=webhook_url,
+            drop_pending_updates=True
+        )
+        return f"Webhook set to: {webhook_url}, Result: {result}"
+    except Exception as e:
+        return f"Error setting webhook: {e}", 500
+
+@app.route('/delete_webhook', methods=['GET'])
+def delete_webhook():
+    """Удаление webhook (для отладки или локальной разработки)"""
+    if not bot_instance:
+        return "Bot not initialized", 503
+        
+    try:
+        result = bot_instance.application.bot.delete_webhook()
+        return f"Webhook deleted, Result: {result}"
+    except Exception as e:
+        return f"Error deleting webhook: {e}", 500
 
 # ==================== ОСНОВНОЙ КЛАСС БОТА ====================
 
@@ -931,6 +971,9 @@ class NutritionBot:
             self.yandex_gpt = YandexGPT()
             self._setup_handlers()
             
+            # РЕГИСТРИРУЕМ ОБРАБОТЧИКИ ЗАВЕРШЕНИЯ
+            self._register_shutdown_handlers()
+            
             health_monitor.update_bot_status("healthy")
             logger.info("✅ Bot initialized successfully")
             
@@ -939,8 +982,28 @@ class NutritionBot:
             logger.error(f"❌ Failed to initialize bot: {e}")
             raise
     
+    def _register_shutdown_handlers(self):
+        """Регистрирует обработчики graceful shutdown"""
+        def shutdown_handler(signum, frame):
+            logger.info("🛑 Received shutdown signal")
+            health_monitor.update_bot_status("shutting_down")
+            if hasattr(self, 'application'):
+                self.application.stop()
+            sys.exit(0)
+        
+        signal.signal(signal.SIGINT, shutdown_handler)
+        signal.signal(signal.SIGTERM, shutdown_handler)
+        
+        # Регистрируем shutdown при выходе
+        atexit.register(self._shutdown)
+    
+    def _shutdown(self):
+        """Корректное завершение работы"""
+        logger.info("🔚 Shutting down bot application")
+        health_monitor.update_bot_status("stopped")
+    
     def _setup_handlers(self):
-        """Настройка обработчиков - ВСЕ методы должны быть реализованы"""
+        """Настройка обработчиков"""
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("menu", self.menu_command))
         self.application.add_handler(CommandHandler("dbstats", self.dbstats_command))
@@ -2090,6 +2153,13 @@ class NutritionBot:
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ошибок"""
         health_monitor.increment_error()
+        
+        # ИГНОРИРУЕМ КОНФЛИКТНЫЕ ОШИБКИ WEBHOOK
+        if (isinstance(context.error, Conflict) and 
+            "webhook is active" in str(context.error)):
+            logger.warning("⚠️ Webhook conflict error (ignored)")
+            return
+            
         logger.error(f"Exception while handling an update: {context.error}")
         
         try:
@@ -2137,27 +2207,52 @@ def run_webhook():
         # Инициализируем бота
         bot_instance = NutritionBot()
         
-        # Настраиваем webhook
+        # НАСТРОЙКА WEBHOOK БЕЗ POLLING
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        bot_instance.application.run_webhook(
-            listen="0.0.0.0",
-            port=int(os.environ.get('PORT', 5000)),
-            url_path=BOT_TOKEN,
-            webhook_url=webhook_url
+        
+        # Устанавливаем webhook
+        bot_instance.application.bot.set_webhook(
+            url=webhook_url,
+            drop_pending_updates=True
         )
         
-        logger.info(f"✅ Webhook bot started on {webhook_url}")
+        logger.info(f"✅ Webhook set to: {webhook_url}")
         health_monitor.update_bot_status("running")
+        
+        # ЗАПУСКАЕМ FLASK APP ОТДЕЛЬНО
+        port = int(os.environ.get('PORT', 5000))
+        logger.info(f"🚀 Starting Flask app on port {port}")
+        
+        app.run(
+            host='0.0.0.0',
+            port=port,
+            debug=False
+        )
         
     except Exception as e:
         health_monitor.update_bot_status("error")
         logger.error(f"❌ Failed to start webhook bot: {e}")
+        raise
+
+def run_polling():
+    """Запускает бота в polling режиме (для локальной разработки)"""
+    try:
+        run_health_checks()
+        bot = NutritionBot()
+        logger.info("🔄 Starting in POLLING mode")
+        bot.application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+    except Exception as e:
+        logger.error(f"❌ Failed to start polling bot: {e}")
+        raise
 
 if __name__ == '__main__':
+    # АВТОМАТИЧЕСКОЕ ОПРЕДЕЛЕНИЕ РЕЖИМА
     if RENDER_EXTERNAL_URL:
         logger.info("🚀 Starting in WEBHOOK mode for Render")
         run_webhook()
     else:
         logger.info("🔄 Starting in POLLING mode for local development")
-        # Для простоты в этом примере только webhook
-        print("Для локальной разработки настройте RENDER_EXTERNAL_URL")
+        run_polling()
