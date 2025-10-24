@@ -2088,83 +2088,45 @@ class NutritionBot:
 
 # ==================== ЗАПУСК ПРИЛОЖЕНИЯ ====================
 
-async def run_health_checks():
-    """Запускает начальные проверки здоровья"""
-    logger.info("🔍 Running initial health checks...")
-    
-    # Сначала инициализируем базу данных
-    init_database()
-    
-    # Затем проверяем здоровье
-    db_healthy = await check_database_health()
-    telegram_healthy = await check_telegram_api_health()
-    yandex_healthy = await check_yandex_gpt_health()
-    
-    if db_healthy and telegram_healthy:
-        logger.info("✅ All health checks passed")
-        return True
-    else:
-        logger.error("❌ Some health checks failed")
-        return False
-
-async def setup_bot():
-    """Настройка бота и webhook"""
+def setup_sync():
+    """Синхронная настройка бота"""
     global bot_application
     
     try:
-        # Запускаем проверки здоровья
-        if not await run_health_checks():
-            logger.error("❌ Health checks failed, cannot start bot")
-            return False
+        # Инициализируем базу данных
+        init_database()
         
-        # Инициализируем бота
+        # Создаем бота
         bot = NutritionBot()
         bot_application = bot.application
         
-        # Настраиваем webhook (ОДИН раз!)
+        # Настраиваем webhook
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         
-        await bot_application.initialize()
-        await bot_application.start()
-        
-        # Устанавливаем webhook
-        await bot_application.bot.set_webhook(
+        # Синхронный запуск асинхронных функций
+        import asyncio
+        asyncio.run(bot_application.initialize())
+        asyncio.run(bot_application.start())
+        asyncio.run(bot_application.bot.set_webhook(
             url=webhook_url,
-            drop_pending_updates=True,
-            max_connections=40
-        )
+            drop_pending_updates=True
+        ))
         
         logger.info(f"✅ Webhook configured: {webhook_url}")
         health_monitor.update_bot_status("running")
-        
         return True
         
     except Exception as e:
-        health_monitor.update_bot_status("error")
-        logger.error(f"❌ Bot setup failed: {e}")
+        logger.error(f"❌ Setup failed: {e}")
         return False
 
-def start_app():
-    """Запуск Flask приложения"""
-    try:
-        # Запускаем настройку бота асинхронно
-        success = asyncio.run(setup_bot())
-        if success:
-            port = int(os.environ.get('PORT', 8080))
-            logger.info(f"🚀 Starting Flask app on port {port}")
-            
-            # Явно указываем host и port для Flask
-            from waitress import serve
-            serve(app, host='0.0.0.0', port=port)
-            
-        else:
-            logger.error("❌ Failed to start application")
-            sys.exit(1)
-    except KeyboardInterrupt:
-        logger.info("🛑 Application stopped by user")
-    except Exception as e:
-        logger.error(f"❌ Fatal error: {e}")
-        sys.exit(1)
-
 if __name__ == '__main__':
-    start_app()
+    # Настраиваем бота
+    logger.info("🚀 Starting application...")
+    if setup_sync():
+        # Запускаем Flask
+        port = int(os.environ.get('PORT', 8080))
+        logger.info(f"🔌 Starting Flask on port {port}")
+        app.run(host='0.0.0.0', port=port, debug=False)
+    else:
+        logger.error("❌ Failed to start application")
