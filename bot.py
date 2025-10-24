@@ -2061,6 +2061,9 @@ async def run_webhook():
         # Инициализируем бота
         bot = NutritionBot()
         
+        # ИНИЦИАЛИЗИРУЕМ Application перед использованием
+        await bot.application.initialize()
+        
         # Настраиваем webhook
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         
@@ -2072,14 +2075,22 @@ async def run_webhook():
         logger.info(f"✅ Webhook set to: {webhook_url}")
         health_monitor.update_bot_status("running")
         
-        # Запускаем application
+        # ЗАПУСКАЕМ application правильно
         await bot.application.start()
-        logger.info("🤖 Bot application started")
+        logger.info("🤖 Bot application started successfully")
         
         # Бесконечный цикл для поддержания работы
         logger.info("🔄 Bot is running and waiting for updates...")
-        while True:
-            await asyncio.sleep(3600)  # Спим 1 час и проверяем снова
+        await bot.application.updater.start_webhook(
+            listen="0.0.0.0",
+            port=int(os.environ.get('PORT', 8080)),
+            url_path=BOT_TOKEN,
+            webhook_url=webhook_url,
+            secret_token=None
+        )
+        
+        # Ожидаем завершения
+        await asyncio.Future()  # Бесконечное ожидание
         
     except Exception as e:
         health_monitor.update_bot_status("error")
@@ -2097,6 +2108,9 @@ async def run_polling():
         bot = NutritionBot()
         logger.info("🔄 Starting in POLLING mode")
         
+        # ИНИЦИАЛИЗИРУЕМ Application перед использованием
+        await bot.application.initialize()
+        
         await bot.application.start()
         await bot.application.updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
@@ -2108,8 +2122,7 @@ async def run_polling():
         
         # Бесконечный цикл для поддержания работы
         logger.info("🔄 Bot is running and waiting for updates...")
-        while True:
-            await asyncio.sleep(3600)  # Спим 1 час и проверяем снова
+        await asyncio.Future()  # Бесконечное ожидание
         
     except Exception as e:
         logger.error(f"❌ Failed to start polling bot: {e}")
