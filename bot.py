@@ -8,6 +8,7 @@ import signal
 import sys
 import re
 from datetime import datetime
+from flask import Flask, jsonify, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from telegram.error import TelegramError, Conflict
@@ -18,6 +19,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Flask приложение
+app = Flask(__name__)
 
 # ==================== КОНФИГУРАЦИЯ ====================
 
@@ -78,6 +82,55 @@ class HealthMonitor:
 
 # Глобальный монитор здоровья
 health_monitor = HealthMonitor()
+
+# Глобальная переменная для бота
+bot_application = None
+
+# ==================== FLASK ROUTES ====================
+
+@app.route('/')
+def home():
+    """Корневой endpoint для проверки работоспособности"""
+    return jsonify({
+        "status": "🤖 Nutrition Bot is running", 
+        "service": "Telegram Nutrition AI Bot",
+        "webhook": f"{RENDER_EXTERNAL_URL}/webhook",
+        "health": health_monitor.get_stats(),
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/health')
+def health_check():
+    """Endpoint для проверки здоровья сервиса"""
+    return jsonify(health_monitor.get_stats())
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Endpoint для webhook Telegram"""
+    global bot_application
+    
+    if bot_application:
+        try:
+            # Обрабатываем update через PTB
+            update = Update.de_json(request.get_json(), bot_application.bot)
+            asyncio.create_task(
+                process_telegram_update(update)
+            )
+            return 'ok'
+        except Exception as e:
+            logger.error(f"Error processing webhook: {e}")
+            return 'error', 500
+    else:
+        logger.error("Bot application not initialized")
+        return 'bot not initialized', 500
+
+async def process_telegram_update(update: Update):
+    """Асинхронная обработка Telegram update"""
+    global bot_application
+    try:
+        await bot_application.process_update(update)
+    except Exception as e:
+        logger.error(f"Error processing telegram update: {e}")
 
 # ==================== БАЗА ДАННЫХ ====================
 
@@ -2050,100 +2103,60 @@ async def run_health_checks():
         logger.error("❌ Some health checks failed")
         return False
 
-async def run_webhook():
-    """Запускает бота с webhook"""
+async def setup_bot():
+    """Настройка бота и webhook"""
+    global bot_application
+    
     try:
-        # Запускаем начальные проверки
+        # Запускаем проверки здоровья
         if not await run_health_checks():
             logger.error("❌ Health checks failed, cannot start bot")
-            return
+            return False
         
         # Инициализируем бота
         bot = NutritionBot()
+        bot_application = bot.application
         
-        # ИНИЦИАЛИЗИРУЕМ Application перед использованием
-        await bot.application.initialize()
-        
-        # Настраиваем webhook
+        # Настраиваем webhook (ОДИН раз!)
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         
-        await bot.application.bot.set_webhook(
+        await bot_application.initialize()
+        await bot_application.start()
+        
+        # Устанавливаем webhook
+        await bot_application.bot.set_webhook(
             url=webhook_url,
-            drop_pending_updates=True
+            drop_pending_updates=True,
+            max_connections=40
         )
         
-        logger.info(f"✅ Webhook set to: {webhook_url}")
+        logger.info(f"✅ Webhook configured: {webhook_url}")
         health_monitor.update_bot_status("running")
         
-        # ЗАПУСКАЕМ application правильно
-        await bot.application.start()
-        logger.info("🤖 Bot application started successfully")
-        
-        # Бесконечный цикл для поддержания работы
-        logger.info("🔄 Bot is running and waiting for updates...")
-        await bot.application.updater.start_webhook(
-            listen="0.0.0.0",
-            port=int(os.environ.get('PORT', 8080)),
-            url_path=BOT_TOKEN,
-            webhook_url=webhook_url,
-            secret_token=None
-        )
-        
-        # Ожидаем завершения
-        await asyncio.Future()  # Бесконечное ожидание
+        return True
         
     except Exception as e:
         health_monitor.update_bot_status("error")
-        logger.error(f"❌ Failed to start webhook bot: {e}")
-        raise
+        logger.error(f"❌ Bot setup failed: {e}")
+        return False
 
-async def run_polling():
-    """Запускает бота в polling режиме (для локальной разработки)"""
+def start_app():
+    """Запуск Flask приложения"""
     try:
-        # Запускаем начальные проверки
-        if not await run_health_checks():
-            logger.error("❌ Health checks failed, cannot start bot")
-            return
-        
-        bot = NutritionBot()
-        logger.info("🔄 Starting in POLLING mode")
-        
-        # ИНИЦИАЛИЗИРУЕМ Application перед использованием
-        await bot.application.initialize()
-        
-        await bot.application.start()
-        await bot.application.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
-        
-        logger.info("🤖 Bot polling started")
-        health_monitor.update_bot_status("running")
-        
-        # Бесконечный цикл для поддержания работы
-        logger.info("🔄 Bot is running and waiting for updates...")
-        await asyncio.Future()  # Бесконечное ожидание
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to start polling bot: {e}")
-        raise
-
-async def main():
-    """Основная функция запуска"""
-    try:
-        if RENDER_EXTERNAL_URL:
-            logger.info("🚀 Starting in WEBHOOK mode for Render")
-            await run_webhook()
+        # Запускаем настройку бота асинхронно
+        success = asyncio.run(setup_bot())
+        if success:
+            port = int(os.environ.get('PORT', 8080))
+            logger.info(f"🚀 Starting Flask app on port {port}")
+            app.run(host='0.0.0.0', port=port, debug=False)
         else:
-            logger.info("🔄 Starting in POLLING mode for local development")
-            await run_polling()
+            logger.error("❌ Failed to start application")
+            sys.exit(1)
     except KeyboardInterrupt:
-        logger.info("🛑 Bot stopped by user")
+        logger.info("🛑 Application stopped by user")
     except Exception as e:
         logger.error(f"❌ Fatal error: {e}")
-    finally:
-        logger.info("🔚 Bot shutdown complete")
+        sys.exit(1)
 
 if __name__ == '__main__':
-    # Запускаем асинхронное приложение
-    asyncio.run(main())
+    start_app()
