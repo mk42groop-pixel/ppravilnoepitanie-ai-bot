@@ -2148,7 +2148,11 @@ def start_app():
         if success:
             port = int(os.environ.get('PORT', 8080))
             logger.info(f"🚀 Starting Flask app on port {port}")
-            app.run(host='0.0.0.0', port=port, debug=False)
+            
+            # Явно указываем host и port для Flask
+            from waitress import serve
+            serve(app, host='0.0.0.0', port=port)
+            
         else:
             logger.error("❌ Failed to start application")
             sys.exit(1)
