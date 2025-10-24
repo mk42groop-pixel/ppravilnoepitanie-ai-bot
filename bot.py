@@ -245,6 +245,21 @@ def get_latest_plan(user_id):
     finally:
         conn.close()
 
+def get_user_plans_count(user_id):
+    """Получает количество планов пользователя"""
+    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('SELECT COUNT(*) FROM nutrition_plans WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        return result[0] if result else 0
+    except Exception as e:
+        logger.error(f"Error getting user plans count: {e}")
+        return 0
+    finally:
+        conn.close()
+
 # ==================== ИНТЕРАКТИВНЫЕ МЕНЮ ====================
 
 class InteractiveMenu:
@@ -293,6 +308,16 @@ class InteractiveMenu:
         keyboard = [
             [InlineKeyboardButton("✅ ЗАПИСАТЬ ДАННЫЕ", callback_data="checkin_data")],
             [InlineKeyboardButton("📊 ПОСМОТРЕТЬ ИСТОРИЮ", callback_data="checkin_history")],
+            [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_main")]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    def get_plan_management_menu(self):
+        """Меню управления планами"""
+        keyboard = [
+            [InlineKeyboardButton("📋 ПРОСМОТРЕТЬ ПЛАН", callback_data="my_plan")],
+            [InlineKeyboardButton("📄 СКАЧАТЬ В TXT", callback_data="download_plan")],
+            [InlineKeyboardButton("📊 ИНФО О ПЛАНАХ", callback_data="plan_info")],
             [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_main")]
         ]
         return InlineKeyboardMarkup(keyboard)
@@ -351,6 +376,8 @@ class NutritionBot:
         """Настройка обработчиков"""
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("menu", self.menu_command))
+        self.application.add_handler(CommandHandler("dbstats", self.dbstats_command))
+        self.application.add_handler(CommandHandler("export_plan", self.export_plan_command))
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         self.application.add_error_handler(self.error_handler)
@@ -391,6 +418,73 @@ class NutritionBot:
             reply_markup=self.menu.get_main_menu()
         )
     
+    async def dbstats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для просмотра информации о БД (только для админа)"""
+        try:
+            user_id = update.effective_user.id
+            if not is_admin(user_id):
+                await update.message.reply_text("❌ Эта команда только для администратора")
+                return
+            
+            conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
+            cursor = conn.cursor()
+            
+            # Получаем статистику
+            cursor.execute("SELECT COUNT(*) FROM users")
+            users_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM nutrition_plans")
+            plans_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM daily_checkins")
+            checkins_count = cursor.fetchone()[0]
+            
+            # Последние планы
+            cursor.execute('''
+                SELECT u.user_id, u.username, np.created_at 
+                FROM nutrition_plans np 
+                JOIN users u ON np.user_id = u.user_id 
+                ORDER BY np.created_at DESC LIMIT 5
+            ''')
+            recent_plans = cursor.fetchall()
+            
+            # Размер БД
+            db_size = os.path.getsize('nutrition_bot.db') if os.path.exists('nutrition_bot.db') else 0
+            
+            conn.close()
+            
+            stats_text = f"""
+📊 СТАТИСТИКА БАЗЫ ДАННЫХ:
+
+👥 Пользователей: {users_count}
+📋 Планов питания: {plans_count}
+📈 Чек-инов: {checkins_count}
+💾 Размер БД: {db_size / 1024:.1f} KB
+
+📅 Последние созданные планы:
+"""
+            for plan in recent_plans:
+                user_id, username, created_at = plan
+                username_display = f"@{username}" if username else "без username"
+                stats_text += f"• ID: {user_id} ({username_display}) - {created_at[:10]}\n"
+            
+            await update.message.reply_text(stats_text)
+            
+        except Exception as e:
+            logger.error(f"Error in db command: {e}")
+            await update.message.reply_text("❌ Ошибка при получении статистики БД")
+    
+    async def export_plan_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для экспорта плана в TXT"""
+        try:
+            user_id = update.effective_user.id
+            await update.message.reply_text("📄 Подготавливаем ваш план для скачивания...")
+            await self.send_plan_as_file(update, context, user_id)
+            
+        except Exception as e:
+            logger.error(f"Error in export plan command: {e}")
+            await update.message.reply_text("❌ Ошибка при подготовке плана для скачивания")
+    
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик callback'ов"""
         query = update.callback_query
@@ -408,9 +502,13 @@ class NutritionBot:
             elif data == "stats":
                 await self._handle_stats(query, context)
             elif data == "my_plan":
-                await self._handle_my_plan(query, context)
+                await self._handle_my_plan_menu(query, context)
             elif data == "help":
                 await self._handle_help(query, context)
+            elif data == "plan_info":
+                await self._handle_plan_info(query, context)
+            elif data == "download_plan":
+                await self._handle_download_plan(query, context)
             
             # Навигация назад
             elif data == "back_main":
@@ -713,6 +811,21 @@ class NutritionBot:
                 reply_markup=self.menu.get_main_menu()
             )
     
+    async def _handle_my_plan_menu(self, query, context):
+        """Обработчик меню моего плана"""
+        try:
+            await query.edit_message_text(
+                "📋 УПРАВЛЕНИЕ ПЛАНОМ ПИТАНИЯ\n\n"
+                "Выберите действие:",
+                reply_markup=self.menu.get_plan_management_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error in my plan menu handler: {e}")
+            await query.edit_message_text(
+                "❌ Ошибка при открытии меню плана",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
     async def _handle_my_plan(self, query, context):
         """Обработчик просмотра текущего плана"""
         try:
@@ -723,7 +836,7 @@ class NutritionBot:
                 await query.edit_message_text(
                     "📋 У вас пока нет созданных планов питания\n\n"
                     "Создайте ваш первый персональный план!",
-                    reply_markup=self.menu.get_main_menu()
+                    reply_markup=self.menu.get_plan_management_menu()
                 )
                 return
             
@@ -746,13 +859,61 @@ class NutritionBot:
             
             await query.edit_message_text(
                 plan_text,
-                reply_markup=self.menu.get_main_menu()
+                reply_markup=self.menu.get_plan_management_menu()
             )
             
         except Exception as e:
             logger.error(f"Error in my_plan handler: {e}")
             await query.edit_message_text(
                 "❌ Ошибка при получении плана",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
+    async def _handle_plan_info(self, query, context):
+        """Обработчик информации о планах"""
+        try:
+            user_id = query.from_user.id
+            plans_count = get_user_plans_count(user_id)
+            latest_plan = get_latest_plan(user_id)
+            
+            info_text = f"📊 ИНФОРМАЦИЯ О ВАШИХ ПЛАНАХ\n\n"
+            info_text += f"📋 Всего создано планов: {plans_count}\n"
+            
+            if latest_plan:
+                created_at = latest_plan.get('created_at', '')
+                if created_at:
+                    created_date = created_at[:10] if 'T' in created_at else created_at[:10]
+                    info_text += f"📅 Последний план создан: {created_date}\n"
+                
+                user_data = latest_plan.get('user_data', {})
+                info_text += f"🎯 Текущая цель: {user_data.get('goal', '')}\n"
+                info_text += f"⚖️ Текущий вес: {user_data.get('weight', '')} кг\n"
+            
+            info_text += f"\n💡 Используйте кнопку 'СКАЧАТЬ В TXT' для экспорта плана в файл"
+            
+            await query.edit_message_text(
+                info_text,
+                reply_markup=self.menu.get_plan_management_menu()
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in plan info handler: {e}")
+            await query.edit_message_text(
+                "❌ Ошибка при получении информации о планах",
+                reply_markup=self.menu.get_main_menu()
+            )
+    
+    async def _handle_download_plan(self, query, context):
+        """Обработчик скачивания плана"""
+        try:
+            user_id = query.from_user.id
+            await query.edit_message_text("📄 Подготавливаем ваш план для скачивания...")
+            await self.send_plan_as_file_from_query(query, context, user_id)
+            
+        except Exception as e:
+            logger.error(f"Error in download plan handler: {e}")
+            await query.edit_message_text(
+                "❌ Ошибка при подготовке плана для скачивания",
                 reply_markup=self.menu.get_main_menu()
             )
     
@@ -777,13 +938,19 @@ class NutritionBot:
 
 📋 МОЙ ПЛАН:
 • Просмотр текущего плана питания
-• Рекомендации и списки покупок
+• Скачивание плана в TXT формате
+• Информация о ваших планах
 
 💡 Советы:
 • Вводите данные точно
 • Следуйте плану питания
 • Регулярно делайте чек-ин
 • Пейте достаточное количество воды
+
+📄 Команды:
+/menu - главное меню
+/export_plan - скачать план в TXT
+/dbstats - статистика БД (только для админа)
 """
         await query.edit_message_text(
             help_text,
@@ -974,6 +1141,143 @@ class NutritionBot:
             await update.message.reply_text(
                 "❌ Произошла ошибка при сохранении чек-ина. Попробуйте снова.",
                 reply_markup=self.menu.get_main_menu()
+            )
+    
+    def save_plan_to_txt(self, user_id, plan_data, filename=None):
+        """Сохраняет план питания в текстовый файл"""
+        try:
+            if not filename:
+                filename = f"nutrition_plan_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            
+            user_data = plan_data.get('user_data', {})
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("=" * 50 + "\n")
+                f.write("🎯 ПЕРСОНАЛЬНЫЙ ПЛАН ПИТАНИЯ\n")
+                f.write("=" * 50 + "\n\n")
+                
+                # Данные пользователя
+                f.write("👤 ДАННЫЕ ПОЛЬЗОВАТЕЛЯ:\n")
+                f.write(f"Пол: {user_data.get('gender', '')}\n")
+                f.write(f"Возраст: {user_data.get('age', '')} лет\n")
+                f.write(f"Рост: {user_data.get('height', '')} см\n")
+                f.write(f"Вес: {user_data.get('weight', '')} кг\n")
+                f.write(f"Цель: {user_data.get('goal', '')}\n")
+                f.write(f"Активность: {user_data.get('activity', '')}\n")
+                f.write(f"Дата создания: {plan_data.get('created_at', '')}\n\n")
+                
+                # Рекомендации
+                f.write("💧 РЕКОМЕНДАЦИИ:\n")
+                f.write(f"Водный режим: {plan_data.get('water_regime', '')}\n")
+                f.write(f"Общие рекомендации: {plan_data.get('general_recommendations', '')}\n\n")
+                
+                # Дни питания
+                f.write("📅 ПЛАН ПИТАНИЯ НА НЕДЕЛЮ:\n")
+                f.write("=" * 50 + "\n\n")
+                
+                for day in plan_data.get('days', []):
+                    f.write(f"🎯 {day['name']}\n")
+                    f.write("-" * 30 + "\n")
+                    f.write(f"Общая калорийность: {day.get('total_calories', '')}\n\n")
+                    
+                    for meal in day.get('meals', []):
+                        f.write(f"{meal['emoji']} {meal['type']} ({meal['time']})\n")
+                        f.write(f"🍽 {meal['name']}\n")
+                        f.write(f"🔥 {meal['calories']}\n")
+                        f.write(f"⏱ Время приготовления: {meal['cooking_time']}\n\n")
+                        
+                        f.write("📋 Ингредиенты:\n")
+                        f.write(f"{meal['ingredients']}\n\n")
+                        
+                        f.write("👩‍🍳 Приготовление:\n")
+                        f.write(f"{meal['instructions']}\n")
+                        f.write("-" * 20 + "\n\n")
+                
+                # Список покупок
+                f.write("🛒 СПИСОК ПОКУПОК НА НЕДЕЛЮ:\n")
+                f.write("=" * 50 + "\n")
+                f.write(plan_data.get('shopping_list', ''))
+                f.write("\n\n")
+                
+                f.write("=" * 50 + "\n")
+                f.write("🍎 Приятного аппетита и успехов в достижении целей! 🍎\n")
+                f.write("=" * 50 + "\n")
+            
+            logger.info(f"✅ Plan saved to {filename}")
+            return filename
+            
+        except Exception as e:
+            logger.error(f"❌ Error saving plan to TXT: {e}")
+            return None
+    
+    async def send_plan_as_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id):
+        """Отправляет план питания как файл"""
+        try:
+            plan = get_latest_plan(user_id)
+            if not plan:
+                await update.message.reply_text("❌ У вас нет сохраненных планов питания")
+                return
+            
+            # Сохраняем план в временный файл
+            filename = self.save_plan_to_txt(user_id, plan)
+            if filename:
+                # Отправляем файл пользователю
+                with open(filename, 'rb') as file:
+                    await update.message.reply_document(
+                        document=file,
+                        filename=f"План_питания_{user_id}.txt",
+                        caption="📄 Ваш план питания в текстовом формате"
+                    )
+                
+                # Удаляем временный файл
+                import os
+                os.remove(filename)
+            else:
+                await update.message.reply_text("❌ Ошибка при создании файла плана")
+                
+        except Exception as e:
+            logger.error(f"❌ Error sending plan as file: {e}")
+            await update.message.reply_text("❌ Ошибка при отправке файла плана")
+    
+    async def send_plan_as_file_from_query(self, query, context, user_id):
+        """Отправляет план как файл из callback запроса"""
+        try:
+            plan = get_latest_plan(user_id)
+            if not plan:
+                await query.edit_message_text(
+                    "❌ У вас нет сохраненных планов питания",
+                    reply_markup=self.menu.get_plan_management_menu()
+                )
+                return
+            
+            filename = self.save_plan_to_txt(user_id, plan)
+            if filename:
+                with open(filename, 'rb') as file:
+                    await context.bot.send_document(
+                        chat_id=user_id,
+                        document=file,
+                        filename=f"План_питания_{user_id}.txt",
+                        caption="📄 Ваш план питания в текстовом формате"
+                    )
+                
+                await query.edit_message_text(
+                    "✅ Ваш план отправлен в виде файла!",
+                    reply_markup=self.menu.get_plan_management_menu()
+                )
+                
+                import os
+                os.remove(filename)
+            else:
+                await query.edit_message_text(
+                    "❌ Ошибка при создании файла плана",
+                    reply_markup=self.menu.get_plan_management_menu()
+                )
+                
+        except Exception as e:
+            logger.error(f"❌ Error sending plan as file from query: {e}")
+            await query.edit_message_text(
+                "❌ Ошибка при отправке файла плана",
+                reply_markup=self.menu.get_plan_management_menu()
             )
     
     async def _generate_plan_with_gpt(self, user_data):
