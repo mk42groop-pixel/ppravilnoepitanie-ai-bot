@@ -81,16 +81,6 @@ def init_database():
         )
     ''')
     
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS shopping_cart (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            ingredient TEXT NOT NULL,
-            checked BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
     conn.commit()
     conn.close()
     logger.info("Database initialized")
@@ -270,72 +260,6 @@ def get_user_plans_count(user_id):
     finally:
         conn.close()
 
-def save_shopping_cart(user_id, ingredients):
-    """Сохраняет корзину покупок"""
-    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
-    cursor = conn.cursor()
-    
-    try:
-        # Удаляем старые записи
-        cursor.execute('DELETE FROM shopping_cart WHERE user_id = ?', (user_id,))
-        
-        # Сохраняем новые ингредиенты
-        for ingredient in ingredients:
-            cursor.execute('''
-                INSERT INTO shopping_cart (user_id, ingredient, checked)
-                VALUES (?, ?, ?)
-            ''', (user_id, ingredient, False))
-        
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Error saving shopping cart: {e}")
-    finally:
-        conn.close()
-
-def get_shopping_cart(user_id):
-    """Получает корзину покупок пользователя"""
-    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute('''
-            SELECT id, ingredient, checked FROM shopping_cart 
-            WHERE user_id = ? ORDER BY created_at
-        ''', (user_id,))
-        items = cursor.fetchall()
-        return items
-    except Exception as e:
-        logger.error(f"Error getting shopping cart: {e}")
-        return []
-    finally:
-        conn.close()
-
-def update_shopping_item(item_id, checked):
-    """Обновляет статус элемента корзины"""
-    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute('UPDATE shopping_cart SET checked = ? WHERE id = ?', (checked, item_id))
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Error updating shopping item: {e}")
-    finally:
-        conn.close()
-
-def clear_shopping_cart(user_id):
-    """Очищает корзину покупок"""
-    conn = sqlite3.connect('nutrition_bot.db', check_same_thread=False)
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute('DELETE FROM shopping_cart WHERE user_id = ?', (user_id,))
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Error clearing shopping cart: {e}")
-    finally:
-        conn.close()
-
 # ==================== ИНТЕРАКТИВНЫЕ МЕНЮ ====================
 
 class InteractiveMenu:
@@ -350,7 +274,6 @@ class InteractiveMenu:
             [InlineKeyboardButton("📈 ЧЕК-ИН", callback_data="checkin")],
             [InlineKeyboardButton("📊 СТАТИСТИКА", callback_data="stats")],
             [InlineKeyboardButton("📋 МОЙ ПЛАН", callback_data="my_plan")],
-            [InlineKeyboardButton("🛒 КОРЗИНА", callback_data="shopping_cart")],
             [InlineKeyboardButton("❓ ПОМОЩЬ", callback_data="help")]
         ]
         return InlineKeyboardMarkup(keyboard)
@@ -393,6 +316,7 @@ class InteractiveMenu:
         """Меню управления планами"""
         keyboard = [
             [InlineKeyboardButton("📅 ПРОСМОТРЕТЬ НЕДЕЛЮ", callback_data="view_week")],
+            [InlineKeyboardButton("🛒 КОРЗИНА ПОКУПОК", callback_data="shopping_cart")],
             [InlineKeyboardButton("📄 СКАЧАТЬ В TXT", callback_data="download_plan")],
             [InlineKeyboardButton("📊 ИНФО О ПЛАНАХ", callback_data="plan_info")],
             [InlineKeyboardButton("↩️ НАЗАД", callback_data="back_main")]
@@ -435,44 +359,13 @@ class InteractiveMenu:
         ]
         return InlineKeyboardMarkup(keyboard)
     
-    def get_shopping_cart_menu(self, items, page=0):
-        """Меню корзины покупок с галочками"""
-        items_per_page = 10
-        start_idx = page * items_per_page
-        end_idx = start_idx + items_per_page
-        current_items = items[start_idx:end_idx]
-        
-        keyboard = []
-        
-        for item in current_items:
-            item_id, ingredient, checked = item
-            status = "✅" if checked else "⬜"
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{status} {ingredient}", 
-                    callback_data=f"toggle_{item_id}"
-                )
-            ])
-        
-        # Навигация по страницам
-        navigation_buttons = []
-        if page > 0:
-            navigation_buttons.append(InlineKeyboardButton("◀️ НАЗАД", callback_data=f"cart_page_{page-1}"))
-        
-        if end_idx < len(items):
-            navigation_buttons.append(InlineKeyboardButton("ВПЕРЕД ▶️", callback_data=f"cart_page_{page+1}"))
-        
-        if navigation_buttons:
-            keyboard.append(navigation_buttons)
-        
-        # Основные кнопки
-        keyboard.extend([
-            [InlineKeyboardButton("🔄 ОБНОВИТЬ СПИСОК ИЗ ПЛАНА", callback_data="refresh_cart")],
-            [InlineKeyboardButton("🧹 ОЧИСТИТЬ КОРЗИНУ", callback_data="clear_cart")],
+    def get_shopping_cart_menu(self):
+        """Меню корзины покупок"""
+        keyboard = [
             [InlineKeyboardButton("📄 СКАЧАТЬ СПИСОК", callback_data="download_shopping_list")],
-            [InlineKeyboardButton("↩️ НАЗАД В МЕНЮ", callback_data="back_main")]
-        ])
-        
+            [InlineKeyboardButton("📅 ПРОСМОТРЕТЬ НЕДЕЛЮ", callback_data="view_week")],
+            [InlineKeyboardButton("↩️ НАЗАД В МЕНЮ", callback_data="back_to_plan_menu")]
+        ]
         return InlineKeyboardMarkup(keyboard)
     
     def get_back_menu(self):
@@ -592,9 +485,6 @@ class NutritionBot:
             cursor.execute("SELECT COUNT(*) FROM daily_checkins")
             checkins_count = cursor.fetchone()[0]
             
-            cursor.execute("SELECT COUNT(*) FROM shopping_cart")
-            cart_count = cursor.fetchone()[0]
-            
             # Последние планы
             cursor.execute('''
                 SELECT u.user_id, u.username, np.created_at 
@@ -615,7 +505,6 @@ class NutritionBot:
 👥 Пользователей: {users_count}
 📋 Планов питания: {plans_count}
 📈 Чек-инов: {checkins_count}
-🛒 Записей в корзинах: {cart_count}
 💾 Размер БД: {db_size / 1024:.1f} KB
 
 📅 Последние созданные планы:
@@ -660,8 +549,6 @@ class NutritionBot:
                 await self._handle_stats(query, context)
             elif data == "my_plan":
                 await self._handle_my_plan_menu(query, context)
-            elif data == "shopping_cart":
-                await self._handle_shopping_cart(query, context)
             elif data == "help":
                 await self._handle_help(query, context)
             elif data == "plan_info":
@@ -670,6 +557,8 @@ class NutritionBot:
                 await self._handle_download_plan(query, context)
             elif data == "view_week":
                 await self._handle_view_week(query, context)
+            elif data == "shopping_cart":
+                await self._handle_shopping_cart(query, context)
             elif data == "download_shopping_list":
                 await self._handle_download_shopping_list(query, context)
             elif data == "back_to_plan_menu":
@@ -704,16 +593,6 @@ class NutritionBot:
                 await self._handle_meal_selection(query, context, data)
             elif data.startswith("next_meal_"):
                 await self._handle_next_meal(query, context, data)
-            
-            # Корзина покупок
-            elif data.startswith("toggle_"):
-                await self._handle_toggle_cart_item(query, context, data)
-            elif data.startswith("cart_page_"):
-                await self._handle_cart_page(query, context, data)
-            elif data == "refresh_cart":
-                await self._handle_refresh_cart(query, context)
-            elif data == "clear_cart":
-                await self._handle_clear_cart(query, context)
             
             else:
                 logger.warning(f"⚠️ Unknown callback data: {data}")
@@ -1242,101 +1121,8 @@ class NutritionBot:
                 reply_markup=self.menu.get_week_days_menu()
             )
     
-    async def _handle_shopping_cart(self, query, context, page=0):
+    async def _handle_shopping_cart(self, query, context):
         """Обработчик корзины покупок"""
-        try:
-            user_id = query.from_user.id
-            items = get_shopping_cart(user_id)
-            
-            if not items:
-                # Если корзина пуста, предлагаем создать из плана
-                plan = get_latest_plan(user_id)
-                if plan:
-                    await self._generate_and_save_shopping_cart(user_id, plan)
-                    items = get_shopping_cart(user_id)
-            
-            if not items:
-                await query.edit_message_text(
-                    "🛒 Ваша корзина покупок пуста\n\n"
-                    "Создайте план питания, чтобы автоматически заполнить корзину",
-                    reply_markup=self.menu.get_main_menu()
-                )
-                return
-            
-            cart_text = "🛒 КОРЗИНА ПОКУПОК\n\n"
-            cart_text += "✅ - куплено, ⬜ - нужно купить\n\n"
-            cart_text += "Нажмите на продукт, чтобы отметить его:\n\n"
-            
-            items_per_page = 10
-            start_idx = page * items_per_page
-            end_idx = start_idx + items_per_page
-            current_items = items[start_idx:end_idx]
-            
-            for i, item in enumerate(current_items, start=start_idx + 1):
-                item_id, ingredient, checked = item
-                status = "✅" if checked else "⬜"
-                cart_text += f"{i}. {status} {ingredient}\n"
-            
-            total_items = len(items)
-            checked_items = sum(1 for item in items if item[2])
-            cart_text += f"\n📊 Прогресс: {checked_items}/{total_items} куплено"
-            
-            if page > 0 or (page + 1) * items_per_page < total_items:
-                cart_text += f"\n📄 Страница {page + 1}"
-            
-            await query.edit_message_text(
-                cart_text,
-                reply_markup=self.menu.get_shopping_cart_menu(items, page)
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in shopping cart handler: {e}")
-            await query.edit_message_text(
-                "❌ Ошибка при загрузке корзины покупок",
-                reply_markup=self.menu.get_main_menu()
-            )
-    
-    async def _handle_toggle_cart_item(self, query, context, data):
-        """Обработчик переключения статуса элемента корзины"""
-        try:
-            item_id = int(data.split('_')[1])
-            user_id = query.from_user.id
-            
-            # Получаем текущий статус
-            items = get_shopping_cart(user_id)
-            current_item = next((item for item in items if item[0] == item_id), None)
-            
-            if current_item:
-                new_checked = not current_item[2]
-                update_shopping_item(item_id, new_checked)
-                
-                # Получаем текущую страницу из контекста
-                page = context.user_data.get('cart_page', 0)
-                await self._handle_shopping_cart(query, context, page)
-                
-        except Exception as e:
-            logger.error(f"Error in toggle cart item handler: {e}")
-            await query.edit_message_text(
-                "❌ Ошибка при обновлении корзины",
-                reply_markup=self.menu.get_main_menu()
-            )
-    
-    async def _handle_cart_page(self, query, context, data):
-        """Обработчик смены страницы корзины"""
-        try:
-            page = int(data.split('_')[2])
-            context.user_data['cart_page'] = page
-            await self._handle_shopping_cart(query, context, page)
-            
-        except Exception as e:
-            logger.error(f"Error in cart page handler: {e}")
-            await query.edit_message_text(
-                "❌ Ошибка при смене страницы",
-                reply_markup=self.menu.get_main_menu()
-            )
-    
-    async def _handle_refresh_cart(self, query, context):
-        """Обработчик обновления корзины из плана"""
         try:
             user_id = query.from_user.id
             plan = get_latest_plan(user_id)
@@ -1348,44 +1134,23 @@ class NutritionBot:
                 )
                 return
             
-            await self._generate_and_save_shopping_cart(user_id, plan)
-            await query.edit_message_text(
-                "✅ Корзина обновлена из текущего плана питания!",
-                reply_markup=self.menu.get_main_menu()
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in refresh cart handler: {e}")
-            await query.edit_message_text(
-                "❌ Ошибка при обновлении корзины",
-                reply_markup=self.menu.get_main_menu()
-            )
-    
-    async def _handle_clear_cart(self, query, context):
-        """Обработчик очистки корзины"""
-        try:
-            user_id = query.from_user.id
-            clear_shopping_cart(user_id)
-            
-            await query.edit_message_text(
-                "✅ Корзина покупок очищена!",
-                reply_markup=self.menu.get_main_menu()
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in clear cart handler: {e}")
-            await query.edit_message_text(
-                "❌ Ошибка при очистке корзины",
-                reply_markup=self.menu.get_main_menu()
-            )
-    
-    def _generate_and_save_shopping_cart(self, user_id, plan):
-        """Генерирует и сохраняет корзину покупок из плана"""
-        try:
             shopping_list = self._generate_shopping_list(plan)
-            save_shopping_cart(user_id, shopping_list)
+            
+            cart_text = "🛒 КОРЗИНА ПОКУПОК НА НЕДЕЛЮ\n\n"
+            cart_text += "📋 Список продуктов:\n\n"
+            cart_text += shopping_list
+            
+            await query.edit_message_text(
+                cart_text,
+                reply_markup=self.menu.get_shopping_cart_menu()
+            )
+            
         except Exception as e:
-            logger.error(f"Error generating shopping cart: {e}")
+            logger.error(f"Error in shopping cart handler: {e}")
+            await query.edit_message_text(
+                "❌ Ошибка при загрузке корзины покупок",
+                reply_markup=self.menu.get_main_menu()
+            )
     
     def _generate_shopping_list(self, plan):
         """Генерирует список покупок на основе плана"""
@@ -1400,72 +1165,43 @@ class NutritionBot:
                     lines = ingredients.split('\n')
                     for line in lines:
                         line = line.strip()
-                        if line and (line.startswith('•') or line.startswith('-') or line[0].isdigit()):
-                            # Убираем маркеры списка и лишние пробелы
-                            clean_line = re.sub(r'^[•\-\d\.\s]+', '', line).strip()
-                            if clean_line:
-                                all_ingredients.append(clean_line)
+                        if line and line.startswith('•'):
+                            all_ingredients.append(line[1:].strip())
             
             # Убираем дубликаты и сортируем
             unique_ingredients = sorted(list(set(all_ingredients)))
             
             if not unique_ingredients:
-                # Демо-данные, если не удалось извлечь ингредиенты
-                return [
-                    "Куриная грудка - 700г",
-                    "Рыба белая - 600г", 
-                    "Овощи сезонные - 2кг",
-                    "Фрукты - 1.5кг",
-                    "Крупы - 1кг",
-                    "Яйца - 10шт",
-                    "Молочные продукты - 1кг",
-                    "Оливковое масло - 200мл",
-                    "Специи - по вкусу"
-                ]
+                return "• Куриная грудка - 700г\n• Рыба белая - 600г\n• Овощи сезонные - 2кг\n• Фрукты - 1.5кг\n• Крупы - 1кг\n• Яйца - 10шт\n• Молочные продукты - 1кг"
             
-            return unique_ingredients[:25]  # Ограничиваем список
+            return '\n'.join([f"• {ingredient}" for ingredient in unique_ingredients[:20]])  # Ограничиваем список
             
         except Exception as e:
             logger.error(f"Error generating shopping list: {e}")
-            return [
-                "Куриная грудка - 700г",
-                "Рыба белая - 600г",
-                "Овощи сезонные - 2кг",
-                "Фрукты - 1.5кг",
-                "Крупы - 1кг"
-            ]
+            return "• Куриная грудка - 700г\n• Рыба белая - 600г\n• Овощи сезонные - 2кг\n• Фрукты - 1.5кг\n• Крупы - 1кг\n• Яйца - 10шт\n• Молочные продукты - 1кг"
     
     async def _handle_download_shopping_list(self, query, context):
         """Обработчик скачивания списка покупок"""
         try:
             user_id = query.from_user.id
-            items = get_shopping_cart(user_id)
+            plan = get_latest_plan(user_id)
             
-            if not items:
+            if not plan:
                 await query.edit_message_text(
-                    "❌ Корзина покупок пуста",
-                    reply_markup=self.menu.get_shopping_cart_menu([], 0)
+                    "❌ У вас нет активного плана питания",
+                    reply_markup=self.menu.get_main_menu()
                 )
                 return
             
+            shopping_list = self._generate_shopping_list(plan)
             filename = f"shopping_list_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             
             with open(filename, 'w', encoding='utf-8') as f:
                 f.write("🛒 СПИСОК ПОКУПОК НА НЕДЕЛЮ\n\n")
                 f.write("📋 Продукты:\n\n")
-                
-                checked_count = 0
-                for i, item in enumerate(items, 1):
-                    item_id, ingredient, checked = item
-                    status = "[✅]" if checked else "[ ]"
-                    f.write(f"{i}. {status} {ingredient}\n")
-                    if checked:
-                        checked_count += 1
-                
-                f.write(f"\n📊 Прогресс: {checked_count}/{len(items)} куплено\n\n")
-                f.write("💡 Советы:\n")
+                f.write(shopping_list)
+                f.write("\n\n💡 Советы:\n")
                 f.write("• Покупайте свежие продукты\n• Проверяйте сроки годности\n• Планируйте покупки на неделю\n")
-                f.write("• Отмечайте купленные продукты в боте\n")
             
             with open(filename, 'rb') as file:
                 await context.bot.send_document(
@@ -1477,7 +1213,7 @@ class NutritionBot:
             
             await query.edit_message_text(
                 "✅ Список покупок отправлен в виде файла!",
-                reply_markup=self.menu.get_shopping_cart_menu(items, 0)
+                reply_markup=self.menu.get_shopping_cart_menu()
             )
             
             import os
@@ -1487,9 +1223,9 @@ class NutritionBot:
             logger.error(f"Error in download shopping list handler: {e}")
             await query.edit_message_text(
                 "❌ Ошибка при создании списка покупок",
-                reply_markup=self.menu.get_main_menu()
+                reply_markup=self.menu.get_shopping_cart_menu()
             )
-
+    
     async def _handle_help(self, query, context):
         """Обработчик помощи"""
         help_text = """
@@ -1508,13 +1244,8 @@ class NutritionBot:
 📋 МОЙ ПЛАН:
 • Просматривайте план на неделю
 • Смотрите детали по дням и приемам пищи
+• Получайте список покупок
 • Скачивайте план в текстовом файле
-
-🛒 КОРЗИНА:
-• Автоматический список покупок из плана
-• Отмечайте купленные продукты галочками
-• Скачивайте список в текстовом файле
-• Обновляйте из текущего плана
 
 💡 СОВЕТЫ:
 • Регулярно вносите данные чек-ина
@@ -1603,14 +1334,10 @@ class NutritionBot:
                 plan_id = save_plan(update.effective_user.id, plan)
                 update_user_limit(update.effective_user.id)
                 
-                # Автоматически создаем корзину покупок
-                self._generate_and_save_shopping_cart(update.effective_user.id, plan)
-                
                 if plan_id:
                     await update.message.reply_text(
                         "✅ Ваш персональный план питания готов!\n\n"
-                        "🛒 Корзина покупок автоматически заполнена\n"
-                        "Используйте меню для просмотра деталей.",
+                        "Используйте меню 'Мой план' для просмотра деталей.",
                         reply_markup=self.menu.get_main_menu()
                     )
                 else:
@@ -1681,12 +1408,12 @@ class NutritionBot:
     async def _generate_nutrition_plan(self, user_data):
         """Генерирует план питания"""
         try:
-            # Если API ключи не настроены, используем улучшенные демо-данные
+            # Если API ключи не настроены, используем демо-данные
             if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
                 return self._generate_demo_plan(user_data)
             
             # Здесь будет интеграция с Yandex GPT API
-            # Пока используем улучшенные демо-данные
+            # Пока используем демо-данные
             return self._generate_demo_plan(user_data)
             
         except Exception as e:
@@ -1694,7 +1421,7 @@ class NutritionBot:
             return self._generate_demo_plan(user_data)
     
     def _generate_demo_plan(self, user_data):
-        """Генерирует улучшенный демо-план питания с разными блюдами"""
+        """Генерирует демо-план питания"""
         days = ['ПОНЕДЕЛЬНИК', 'ВТОРНИК', 'СРЕДА', 'ЧЕТВЕРГ', 'ПЯТНИЦА', 'СУББОТА', 'ВОСКРЕСЕНЬЕ']
         meals_structure = [
             {'type': 'ЗАВТРАК', 'time': '08:00', 'emoji': '🍳'},
@@ -1704,268 +1431,43 @@ class NutritionBot:
             {'type': 'УЖИН', 'time': '20:00', 'emoji': '🍛'}
         ]
         
-        # Разные блюда для каждого дня недели
-        weekly_meals = {
-            'ПОНЕДЕЛЬНИК': [
-                {
-                    'name': 'Овсянка с ягодами и орехами',
-                    'calories': '350 ккал',
-                    'ingredients': '• Овсяные хлопья - 50г\n• Молоко - 200мл\n• Ягоды свежие - 100г\n• Орехи грецкие - 20г\n• Мед - 1 ч.л.',
-                    'instructions': '1. Сварите овсянку на молоке\n2. Добавьте ягоды и орехи\n3. Полейте медом',
-                    'cooking_time': '15 мин'
-                },
-                {
-                    'name': 'Творог с фруктами',
-                    'calories': '200 ккал',
-                    'ingredients': '• Творог обезжиренный - 150г\n• Яблоко - 1 шт\n• Корица - щепотка',
-                    'instructions': '1. Нарежьте яблоко кубиками\n2. Смешайте с творогом\n3. Посыпьте корицей',
-                    'cooking_time': '5 мин'
-                },
-                {
-                    'name': 'Куриная грудка с гречкой и овощами',
-                    'calories': '450 ккал',
-                    'ingredients': '• Куриная грудка - 150г\n• Гречка - 100г\n• Овощи замороженные - 200г\n• Масло оливковое - 1 ст.л.',
-                    'instructions': '1. Отварите гречку\n2. Обжарьте куриную грудку\n3. Потушите овощи\n4. Подавайте вместе',
-                    'cooking_time': '25 мин'
-                },
-                {
-                    'name': 'Йогурт с орехами',
-                    'calories': '180 ккал',
-                    'ingredients': '• Греческий йогурт - 150г\n• Миндаль - 30г\n• Ягоды сушеные - 20г',
-                    'instructions': '1. Смешайте йогурт с орехами\n2. Добавьте сушеные ягоды',
-                    'cooking_time': '2 мин'
-                },
-                {
-                    'name': 'Рыба на пару с брокколи',
-                    'calories': '400 ккал',
-                    'ingredients': '• Филе белой рыбы - 200г\n• Брокколи - 200г\n• Лимон - 1 долька\n• Специи по вкусу',
-                    'instructions': '1. Приготовьте рыбу на пару\n2. Отварите брокколи\n3. Подавайте с лимоном',
-                    'cooking_time': '20 мин'
-                }
-            ],
-            'ВТОРНИК': [
-                {
-                    'name': 'Омлет с овощами',
-                    'calories': '320 ккал',
-                    'ingredients': '• Яйца - 2 шт\n• Помидор - 1 шт\n• Перец болгарский - 1/2 шт\n• Лук репчатый - 1/4 шт\n• Масло оливковое - 1 ч.л.',
-                    'instructions': '1. Нарежьте овощи\n2. Взбейте яйца\n3. Обжарьте овощи, добавьте яйца\n4. Готовьте под крышкой',
-                    'cooking_time': '15 мин'
-                },
-                {
-                    'name': 'Фруктовый салат',
-                    'calories': '180 ккал',
-                    'ingredients': '• Яблоко - 1 шт\n• Банан - 1/2 шт\n• Апельсин - 1/2 шт\n• Йогурт натуральный - 100г',
-                    'instructions': '1. Нарежьте фрукты кубиками\n2. Заправьте йогуртом\n3. Аккуратно перемешайте',
-                    'cooking_time': '10 мин'
-                },
-                {
-                    'name': 'Индейка с бурым рисом',
-                    'calories': '480 ккал',
-                    'ingredients': '• Филе индейки - 150г\n• Бурый рис - 100г\n• Морковь - 1 шт\n• Кабачок - 1/2 шт',
-                    'instructions': '1. Отварите рис\n2. Обжарьте индейку\n3. Потушите овощи\n4. Подавайте вместе',
-                    'cooking_time': '30 мин'
-                },
-                {
-                    'name': 'Ореховый микс',
-                    'calories': '220 ккал',
-                    'ingredients': '• Миндаль - 20г\n• Грецкие орехи - 15г\n• Финики - 2 шт',
-                    'instructions': '1. Смешайте орехи\n2. Добавьте финики',
-                    'cooking_time': '2 мин'
-                },
-                {
-                    'name': 'Тушеная говядина с овощами',
-                    'calories': '420 ккал',
-                    'ingredients': '• Говядина - 150г\n• Брокколи - 150г\n• Цветная капуста - 150г\n• Лук - 1/2 шт',
-                    'instructions': '1. Обжарьте мясо\n2. Добавьте овощи\n3. Тушите 20 минут',
-                    'cooking_time': '35 мин'
-                }
-            ],
-            'СРЕДА': [
-                {
-                    'name': 'Гречневая каша с молоком',
-                    'calories': '340 ккал',
-                    'ingredients': '• Гречка - 60г\n• Молоко - 200мл\n• Мед - 1 ч.л.\n• Корица - щепотка',
-                    'instructions': '1. Сварите гречку на молоке\n2. Добавьте мед и корицу',
-                    'cooking_time': '20 мин'
-                },
-                {
-                    'name': 'Сырники',
-                    'calories': '280 ккал',
-                    'ingredients': '• Творог - 200г\n• Яйцо - 1 шт\n• Мука цельнозерновая - 2 ст.л.\n• Ванилин - щепотка',
-                    'instructions': '1. Смешайте ингредиенты\n2. Сформируйте сырники\n3. Обжарьте на антипригарной сковороде',
-                    'cooking_time': '20 мин'
-                },
-                {
-                    'name': 'Рыбный суп',
-                    'calories': '380 ккал',
-                    'ingredients': '• Филе рыбы - 150г\n• Картофель - 2 шт\n• Морковь - 1 шт\n• Лук - 1/2 шт\n• Зелень',
-                    'instructions': '1. Сварите бульон\n2. Добавьте овощи\n3. Добавьте рыбу\n4. Посыпьте зеленью',
-                    'cooking_time': '40 мин'
-                },
-                {
-                    'name': 'Яблоко с арахисовой пастой',
-                    'calories': '190 ккал',
-                    'ingredients': '• Яблоко - 1 шт\n• Арахисовая паста - 1 ст.л.',
-                    'instructions': '1. Нарежьте яблоко дольками\n2. Намажьте арахисовой пастой',
-                    'cooking_time': '3 мин'
-                },
-                {
-                    'name': 'Куриные котлеты с салатом',
-                    'calories': '390 ккал',
-                    'ingredients': '• Фарш куриный - 180г\n• Лук - 1/4 шт\n• Салат листовой - 100г\n• Огурцы - 2 шт\n• Помидоры - 1 шт',
-                    'instructions': '1. Приготовьте котлеты\n2. Нарежьте салат\n3. Подавайте вместе',
-                    'cooking_time': '25 мин'
-                }
-            ],
-            'ЧЕТВЕРГ': [
-                {
-                    'name': 'Тост с авокадо и яйцом',
-                    'calories': '360 ккал',
-                    'ingredients': '• Хлеб цельнозерновой - 2 ломтика\n• Авокадо - 1/2 шт\n• Яйцо - 1 шт\n• Соль, перец',
-                    'instructions': '1. Поджарьте хлеб\n2. Разомните авокадо\n3. Приготовьте яйцо\n4. Соберите тост',
-                    'cooking_time': '15 мин'
-                },
-                {
-                    'name': 'Смузи зеленый',
-                    'calories': '210 ккал',
-                    'ingredients': '• Шпинат - 50г\n• Банан - 1 шт\n• Яблоко - 1/2 шт\n• Вода - 150мл\n• Лимонный сок - 1 ч.л.',
-                    'instructions': '1. Нарежьте фрукты\n2. Смешайте все в блендере\n3. Подавайте охлажденным',
-                    'cooking_time': '8 мин'
-                },
-                {
-                    'name': 'Паста с морепродуктами',
-                    'calories': '460 ккал',
-                    'ingredients': '• Паста цельнозерновая - 80г\n• Морепродукты - 150г\n• Чеснок - 2 зубчика\n• Помидоры черри - 100г',
-                    'instructions': '1. Отварите пасту\n2. Обжарьте морепродукты\n3. Смешайте с пастой',
-                    'cooking_time': '25 мин'
-                },
-                {
-                    'name': 'Творожная запеканка',
-                    'calories': '240 ккал',
-                    'ingredients': '• Творог - 150г\n• Яйцо - 1 шт\n• Манка - 1 ст.л.\n• Изюм - 20г',
-                    'instructions': '1. Смешайте ингредиенты\n2. Выпекайте 25 минут\n3. Подавайте теплым',
-                    'cooking_time': '35 мин'
-                },
-                {
-                    'name': 'Овощное рагу',
-                    'calories': '350 ккал',
-                    'ingredients': '• Кабачок - 1 шт\n• Баклажан - 1 шт\n• Перец - 1 шт\n• Помидоры - 2 шт\n• Лук - 1/2 шт',
-                    'instructions': '1. Нарежьте овощи\n2. Тушите 20 минут\n3. Добавьте специи',
-                    'cooking_time': '30 мин'
-                }
-            ],
-            'ПЯТНИЦА': [
-                {
-                    'name': 'Рисовая каша с тыквой',
-                    'calories': '330 ккал',
-                    'ingredients': '• Рис - 50г\n• Тыква - 150г\n• Молоко - 200мл\n• Корица - щепотка',
-                    'instructions': '1. Сварите рис с тыквой\n2. Добавьте молоко\n3. Посыпьте корицей',
-                    'cooking_time': '25 мин'
-                },
-                {
-                    'name': 'Бутерброд с лососем',
-                    'calories': '270 ккал',
-                    'ingredients': '• Хлеб цельнозерновой - 1 ломтик\n• Лосось слабосоленый - 50г\n• Огурец - 1/2 шт\n• Сыр - 30г',
-                    'instructions': '1. Нарежьте овощи\n2. Соберите бутерброд',
-                    'cooking_time': '5 мин'
-                },
-                {
-                    'name': 'Суп-пюре из брокколи',
-                    'calories': '320 ккал',
-                    'ingredients': '• Брокколи - 300г\n• Картофель - 1 шт\n• Лук - 1/2 шт\n• Сливки 10% - 50мл',
-                    'instructions': '1. Отварите овощи\n2. Взбейте блендером\n3. Добавьте сливки',
-                    'cooking_time': '30 мин'
-                },
-                {
-                    'name': 'Фруктовое желе',
-                    'calories': '150 ккал',
-                    'ingredients': '• Желе фруктовое - 1 порция\n• Фрукты свежие - 100г',
-                    'instructions': '1. Приготовьте желе по инструкции\n2. Добавьте фрукты\n3. Охладите',
-                    'cooking_time': '15 мин + охлаждение'
-                },
-                {
-                    'name': 'Курица терияки с овощами',
-                    'calories': '410 ккал',
-                    'ingredients': '• Куриное филе - 150г\n• Соус терияки - 2 ст.л.\n• Морковь - 1 шт\n• Стручковая фасоль - 150г',
-                    'instructions': '1. Обжарьте курицу\n2. Добавьте соус\n3. Потушите с овощами',
-                    'cooking_time': '25 мин'
-                }
-            ],
-            'СУББОТА': [
-                {
-                    'name': 'Блины цельнозерновые',
-                    'calories': '380 ккал',
-                    'ingredients': '• Мука цельнозерновая - 60г\n• Молоко - 150мл\n• Яйцо - 1 шт\n• Мед - 1 ст.л.',
-                    'instructions': '1. Приготовьте тесто\n2. Жарьте блины\n3. Подавайте с медом',
-                    'cooking_time': '20 мин'
-                },
-                {
-                    'name': 'Салат Цезарь',
-                    'calories': '290 ккал',
-                    'ingredients': '• Куриная грудка - 100г\n• Салат айсберг - 100г\n• Сухарики - 20г\n• Соус Цезарь - 1 ст.л.',
-                    'instructions': '1. Нарежьте салат\n2. Добавьте курицу\n3. Заправьте соусом',
-                    'cooking_time': '15 мин'
-                },
-                {
-                    'name': 'Плов с курицей',
-                    'calories': '470 ккал',
-                    'ingredients': '• Рис - 100г\n• Куриное филе - 150г\n• Морковь - 1 шт\n• Лук - 1/2 шт\n• Специи',
-                    'instructions': '1. Обжарьте овощи\n2. Добавьте курицу\n3. Добавьте рис и воду\n4. Тушите 20 минут',
-                    'cooking_time': '40 мин'
-                },
-                {
-                    'name': 'Йогурт с гранолой',
-                    'calories': '230 ккал',
-                    'ingredients': '• Греческий йогурт - 150г\n• Гранола - 30г\n• Ягоды - 50г',
-                    'instructions': '1. Выложите йогурт\n2. Посыпьте гранолой\n3. Добавьте ягоды',
-                    'cooking_time': '3 мин'
-                },
-                {
-                    'name': 'Запеченная рыба с картофелем',
-                    'calories': '430 ккал',
-                    'ingredients': '• Филе рыбы - 200г\n• Картофель - 2 шт\n• Лимон - 1 долька\n• Специи',
-                    'instructions': '1. Нарежьте картофель\n2. Запекайте 30 минут\n3. Добавьте рыбу\n4. Запекайте еще 15 минут',
-                    'cooking_time': '45 мин'
-                }
-            ],
-            'ВОСКРЕСЕНЬЕ': [
-                {
-                    'name': 'Яичница с помидорами',
-                    'calories': '310 ккал',
-                    'ingredients': '• Яйца - 2 шт\n• Помидоры - 2 шт\n• Лук зеленый - 10г\n• Масло оливковое - 1 ч.л.',
-                    'instructions': '1. Нарежьте помидоры\n2. Обжарьте с луком\n3. Добавьте яйца\n4. Жарьте до готовности',
-                    'cooking_time': '12 мин'
-                },
-                {
-                    'name': 'Овсяное печенье',
-                    'calories': '260 ккал',
-                    'ingredients': '• Овсяные хлопья - 40г\n• Банан - 1 шт\n• Мед - 1 ч.л.\n• Корица - щепотка',
-                    'instructions': '1. Разомните банан\n2. Смешайте с овсянкой\n3. Выпекайте 15 минут',
-                    'cooking_time': '25 мин'
-                },
-                {
-                    'name': 'Стейк из говядины с салатом',
-                    'calories': '490 ккал',
-                    'ingredients': '• Говядина - 180г\n• Руккола - 100г\n• Помидоры черри - 100г\n• Оливковое масло - 1 ст.л.',
-                    'instructions': '1. Обжарьте стейк\n2. Приготовьте салат\n3. Подавайте вместе',
-                    'cooking_time': '20 мин'
-                },
-                {
-                    'name': 'Творожный мусс',
-                    'calories': '210 ккал',
-                    'ingredients': '• Творог - 150г\n• Йогурт - 50г\n• Мед - 1 ч.л.\n• Ванилин',
-                    'instructions': '1. Взбейте творог с йогуртом\n2. Добавьте мед\n3. Охладите',
-                    'cooking_time': '10 мин'
-                },
-                {
-                    'name': 'Овощи гриль',
-                    'calories': '340 ккал',
-                    'ingredients': '• Кабачок - 1 шт\n• Баклажан - 1 шт\n• Перец - 2 шт\n• Лук - 1 шт\n• Масло оливковое - 1 ст.л.',
-                    'instructions': '1. Нарежьте овощи\n2. Сбрызните маслом\n3. Жарьте на гриле',
-                    'cooking_time': '20 мин'
-                }
-            ]
-        }
+        demo_meals = [
+            {
+                'name': 'Овсянка с ягодами и орехами',
+                'calories': '350 ккал',
+                'ingredients': '• Овсяные хлопья - 50г\n• Молоко - 200мл\n• Ягоды свежие - 100г\n• Орехи грецкие - 20г\n• Мед - 1 ч.л.',
+                'instructions': '1. Сварите овсянку на молоке\n2. Добавьте ягоды и орехи\n3. Полейте медом',
+                'cooking_time': '15 мин'
+            },
+            {
+                'name': 'Творог с фруктами',
+                'calories': '200 ккал',
+                'ingredients': '• Творог обезжиренный - 150г\n• Яблоко - 1 шт\n• Корица - щепотка',
+                'instructions': '1. Нарежьте яблоко кубиками\n2. Смешайте с творогом\n3. Посыпьте корицей',
+                'cooking_time': '5 мин'
+            },
+            {
+                'name': 'Куриная грудка с гречкой и овощами',
+                'calories': '450 ккал',
+                'ingredients': '• Куриная грудка - 150г\n• Гречка - 100г\n• Овощи замороженные - 200г\n• Масло оливковое - 1 ст.л.',
+                'instructions': '1. Отварите гречку\n2. Обжарьте куриную грудку\n3. Потушите овощи\n4. Подавайте вместе',
+                'cooking_time': '25 мин'
+            },
+            {
+                'name': 'Йогурт с орехами',
+                'calories': '180 ккал',
+                'ingredients': '• Греческий йогурт - 150г\n• Миндаль - 30г\n• Ягоды сушеные - 20г',
+                'instructions': '1. Смешайте йогурт с орехами\n2. Добавьте сушеные ягоды',
+                'cooking_time': '2 мин'
+            },
+            {
+                'name': 'Рыба на пару с брокколи',
+                'calories': '400 ккал',
+                'ingredients': '• Филе белой рыбы - 200г\n• Брокколи - 200г\n• Лимон - 1 долька\n• Специи по вкусу',
+                'instructions': '1. Приготовьте рыбу на пару\n2. Отварите брокколи\n3. Подавайте с лимоном',
+                'cooking_time': '20 мин'
+            }
+        ]
         
         plan = {
             'user_data': user_data,
@@ -1975,13 +1477,12 @@ class NutritionBot:
         for i, day_name in enumerate(days):
             day_plan = {
                 'name': day_name,
-                'total_calories': '~1800-2000 ккал',
+                'total_calories': '~1800 ккал',
                 'meals': []
             }
             
-            day_meals = weekly_meals[day_name]
             for j, meal_struct in enumerate(meals_structure):
-                meal = day_meals[j].copy()
+                meal = demo_meals[j].copy()
                 meal.update(meal_struct)
                 day_plan['meals'].append(meal)
             
@@ -1990,7 +1491,7 @@ class NutritionBot:
         return plan
     
     async def send_plan_as_file(self, update, context, user_id):
-        """Отправляет план в виде файла с улучшенным форматированием"""
+        """Отправляет план в виде файла"""
         try:
             plan = get_latest_plan(user_id)
             if not plan:
@@ -2003,58 +1504,35 @@ class NutritionBot:
             filename = f"nutrition_plan_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             
             with open(filename, 'w', encoding='utf-8') as f:
-                f.write("🍎 ПЕРСОНАЛЬНЫЙ ПЛАН ПИТАНИЯ\n")
-                f.write("=" * 50 + "\n\n")
+                f.write("🍎 ПЕРСОНАЛЬНЫЙ ПЛАН ПИТАНИЯ\n\n")
                 
                 # Информация о пользователе
                 user_data = plan.get('user_data', {})
                 f.write("👤 ВАШИ ДАННЫЕ:\n")
-                f.write(f"   Пол: {user_data.get('gender', '')}\n")
-                f.write(f"   Возраст: {user_data.get('age', '')} лет\n")
-                f.write(f"   Рост: {user_data.get('height', '')} см\n")
-                f.write(f"   Вес: {user_data.get('weight', '')} кг\n")
-                f.write(f"   Цель: {user_data.get('goal', '')}\n")
-                f.write(f"   Активность: {user_data.get('activity', '')}\n\n")
-                
-                # Список покупок
-                f.write("🛒 СПИСОК ПОКУПОК НА НЕДЕЛЮ:\n")
-                f.write("-" * 40 + "\n")
-                shopping_list = self._generate_shopping_list(plan)
-                for i, item in enumerate(shopping_list, 1):
-                    f.write(f"{i}. {item}\n")
-                f.write("\n")
+                f.write(f"Пол: {user_data.get('gender', '')}\n")
+                f.write(f"Возраст: {user_data.get('age', '')} лет\n")
+                f.write(f"Рост: {user_data.get('height', '')} см\n")
+                f.write(f"Вес: {user_data.get('weight', '')} кг\n")
+                f.write(f"Цель: {user_data.get('goal', '')}\n")
+                f.write(f"Активность: {user_data.get('activity', '')}\n\n")
                 
                 # План на неделю
-                f.write("📅 ПЛАН ПИТАНИЯ НА НЕДЕЛЮ:\n")
-                f.write("=" * 50 + "\n\n")
+                f.write("📅 ПЛАН НА НЕДЕЛЮ:\n\n")
                 
                 for day in plan.get('days', []):
                     f.write(f"=== {day['name']} ===\n")
-                    f.write(f"🔥 Общая калорийность: {day.get('total_calories', '~1800-2000 ккал')}\n\n")
+                    f.write(f"Общая калорийность: {day.get('total_calories', '~1800 ккал')}\n\n")
                     
                     for meal in day.get('meals', []):
                         f.write(f"{meal['emoji']} {meal['type']} ({meal['time']})\n")
-                        f.write(f"   Блюдо: {meal['name']}\n")
-                        f.write(f"   Калории: {meal['calories']}\n")
-                        f.write(f"   Время приготовления: {meal['cooking_time']}\n")
-                        f.write("   Ингредиенты:\n")
-                        ingredients_lines = meal['ingredients'].split('\n')
-                        for line in ingredients_lines:
-                            f.write(f"     {line}\n")
-                        f.write("   Приготовление:\n")
-                        instructions_lines = meal['instructions'].split('\n')
-                        for line in instructions_lines:
-                            f.write(f"     {line}\n")
+                        f.write(f"Блюдо: {meal['name']}\n")
+                        f.write(f"Калории: {meal['calories']}\n")
+                        f.write(f"Время приготовления: {meal['cooking_time']}\n")
+                        f.write("Ингредиенты:\n")
+                        f.write(f"{meal['ingredients']}\n")
+                        f.write("Приготовление:\n")
+                        f.write(f"{meal['instructions']}\n")
                         f.write("-" * 40 + "\n\n")
-                
-                f.write("\n💡 СОВЕТЫ:\n")
-                f.write("• Пейте достаточное количество воды (1.5-2 л в день)\n")
-                f.write("• Соблюдайте режим питания\n")
-                f.write("• Сочетайте питание с физической активностью\n")
-                f.write("• Слушайте свой организм и корректируйте при необходимости\n")
-                f.write("• Используйте корзину покупок в боте для отслеживания покупок\n\n")
-                
-                f.write(f"📅 План создан: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n")
             
             # Отправляем файл
             with open(filename, 'rb') as file:
@@ -2062,14 +1540,14 @@ class NutritionBot:
                     await update.message.reply_document(
                         document=file,
                         filename=f"План_питания_{user_id}.txt",
-                        caption="📄 Ваш персональный план питания со списком покупок"
+                        caption="📄 Ваш персональный план питания"
                     )
                 else:
                     await context.bot.send_document(
                         chat_id=user_id,
                         document=file,
                         filename=f"План_питания_{user_id}.txt",
-                        caption="📄 Ваш персональный план питания со списком покупок"
+                        caption="📄 Ваш персональный план питания"
                     )
             
             # Удаляем временный файл
@@ -2109,12 +1587,11 @@ def run_bot():
         
         # Запускаем Flask в отдельном потоке
         def run_flask():
-            port = int(os.environ.get('PORT', 5000))
-            app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+            app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
         
         flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
-        logger.info(f"✅ Flask server started on port {os.environ.get('PORT', 5000)}")
+        logger.info("✅ Flask server started on port 5000")
         
         # Запускаем бота
         logger.info("✅ Starting bot polling...")
