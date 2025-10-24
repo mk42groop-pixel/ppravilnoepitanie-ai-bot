@@ -3,7 +3,7 @@ import logging
 import asyncio
 import sqlite3
 import json
-import aiohttp
+import httpx
 import signal
 import sys
 import re
@@ -421,14 +421,14 @@ async def check_database_health():
 async def check_telegram_api_health():
     """Проверяет доступность Telegram API"""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f'https://api.telegram.org/bot{BOT_TOKEN}/getMe', timeout=10) as response:
-                if response.status == 200:
-                    health_monitor.update_telegram_status("healthy")
-                    return True
-                else:
-                    health_monitor.update_telegram_status("error")
-                    return False
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f'https://api.telegram.org/bot{BOT_TOKEN}/getMe')
+            if response.status_code == 200:
+                health_monitor.update_telegram_status("healthy")
+                return True
+            else:
+                health_monitor.update_telegram_status("error")
+                return False
     except Exception as e:
         health_monitor.update_telegram_status("error")
         logger.error(f"❌ Telegram API health check failed: {e}")
@@ -461,15 +461,15 @@ async def check_yandex_gpt_health():
             ]
         }
         
-        async with aiohttp.ClientSession() as session:
-            async with session.post(YANDEX_GPT_URL, headers=headers, json=data, timeout=15) as response:
-                if response.status == 200:
-                    health_monitor.update_yandex_gpt_status("healthy")
-                    return True
-                else:
-                    health_monitor.update_yandex_gpt_status("error")
-                    return False
-                    
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(YANDEX_GPT_URL, headers=headers, json=data)
+            if response.status_code == 200:
+                health_monitor.update_yandex_gpt_status("healthy")
+                return True
+            else:
+                health_monitor.update_yandex_gpt_status("error")
+                return False
+                
     except Exception as e:
         health_monitor.update_yandex_gpt_status("error")
         logger.error(f"❌ Yandex GPT health check failed: {e}")
@@ -517,28 +517,29 @@ class YandexGPT:
                 ]
             }
             
-            async with aiohttp.ClientSession() as session:
-                async with session.post(self.url, headers=headers, json=data, timeout=30) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        plan_text = result['result']['alternatives'][0]['message']['text']
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(self.url, headers=headers, json=data)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    plan_text = result['result']['alternatives'][0]['message']['text']
+                    
+                    json_match = re.search(r'\{.*\}', plan_text, re.DOTALL)
+                    if json_match:
+                        plan_json = json.loads(json_match.group())
+                        plan_json['user_data'] = user_data
                         
-                        json_match = re.search(r'\{.*\}', plan_text, re.DOTALL)
-                        if json_match:
-                            plan_json = json.loads(json_match.group())
-                            plan_json['user_data'] = user_data
-                            
-                            # Добавляем рекомендации по воде если их нет
-                            if 'water_recommendation' not in plan_json:
-                                plan_json['water_recommendation'] = self._get_water_recommendation(user_data)
-                            
-                            return plan_json
-                        else:
-                            logger.error("No JSON found in GPT response")
-                            return self._generate_demo_plan(user_data)
+                        # Добавляем рекомендации по воде если их нет
+                        if 'water_recommendation' not in plan_json:
+                            plan_json['water_recommendation'] = self._get_water_recommendation(user_data)
+                        
+                        return plan_json
                     else:
-                        logger.error(f"Yandex GPT API error: {response.status}")
+                        logger.error("No JSON found in GPT response")
                         return self._generate_demo_plan(user_data)
+                else:
+                    logger.error(f"Yandex GPT API error: {response.status_code}")
+                    return self._generate_demo_plan(user_data)
                 
         except Exception as e:
             logger.error(f"Error generating plan with Yandex GPT: {e}")
@@ -575,7 +576,7 @@ class YandexGPT:
 - Время приготовления
 - Рекомендации по потреблению воды
 
-Верни ответ ТОЛЬКО в формате JSON без дополнительного текста.
+Верни ответ ТОЛЬКО в format JSON без дополнительного текста.
 """
         return prompt
     
