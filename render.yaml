@@ -1,18 +1,13 @@
 services:
   - type: web
-    name: nutrition-bot
+    name: training-plans-dashboard
     env: python
-    plan: free
-    branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: gunicorn app:app
     envVars:
-      - key: BOT_TOKEN
+      - key: SECRET_KEY
+        generateValue: true
+      - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: YANDEX_API_KEY
-        sync: false  
-      - key: YANDEX_FOLDER_ID
+      - key: TELEGRAM_CHANNEL_ID
         sync: false
-      - key: PORT
-        value: 10000
-    healthCheckPath: /health
