@@ -1,11 +1,9 @@
 import os
 import sqlite3
-import json
 import logging
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
-import asyncio
 
 # Настройка логирования
 logging.basicConfig(
@@ -22,55 +20,74 @@ app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-producti
 class Config:
     TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
     TELEGRAM_CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_ID', '')
-    DATABASE_URL = 'training_plans.db'
-    
-    @classmethod
-    def validate(cls):
-        if not cls.TELEGRAM_BOT_TOKEN:
-            logger.warning("⚠️ TELEGRAM_BOT_TOKEN не установлен")
-        else:
-            logger.info("✅ TELEGRAM_BOT_TOKEN установлен")
-            
-        if not cls.TELEGRAM_CHANNEL_ID:
-            logger.warning("⚠️ TELEGRAM_CHANNEL_ID не установлен")
-        else:
-            logger.info(f"✅ TELEGRAM_CHANNEL_ID: {cls.TELEGRAM_CHANNEL_ID}")
-            
-        return True
 
-# Инициализация базы данных
+# Инициализация базы данных (в памяти для надежности)
 def init_database():
-    conn = sqlite3.connect(Config.DATABASE_URL)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            role TEXT DEFAULT 'editor',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Добавляем администратора
-    cursor.execute('SELECT * FROM users WHERE username = ?', ('admin',))
-    if not cursor.fetchone():
-        password_hash = generate_password_hash('admin123')
-        cursor.execute(
-            'INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)',
-            ('admin', password_hash, 'admin')
-        )
-        logger.info("✅ Администратор создан: admin / admin123")
-    
-    conn.commit()
-    conn.close()
-    logger.info("✅ База данных инициализирована")
+    """Создаем базу данных в памяти при каждом запуске"""
+    try:
+        # Используем SQLite в памяти для избежания проблем с файловой системой
+        conn = sqlite3.connect(':memory:')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT DEFAULT 'editor',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Добавляем администратора если его нет
+        cursor.execute('SELECT * FROM users WHERE username = ?', ('admin',))
+        if not cursor.fetchone():
+            password_hash = generate_password_hash('admin123')
+            cursor.execute(
+                'INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)',
+                ('admin', password_hash, 'admin')
+            )
+            logger.info("✅ Администратор создан: admin / admin123")
+        
+        conn.commit()
+        
+        # Сохраняем соединение в глобальной переменной
+        app.config['DATABASE_CONN'] = conn
+        app.config['DATABASE_CURSOR'] = cursor
+        
+        logger.info("✅ База данных инициализирована в памяти")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации базы данных: {e}")
 
 def get_db_connection():
-    conn = sqlite3.connect(Config.DATABASE_URL)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Получаем соединение с базой данных"""
+    try:
+        if 'DATABASE_CONN' not in app.config:
+            init_database()
+        
+        # Проверяем, что соединение активно
+        conn = app.config['DATABASE_CONN']
+        cursor = app.config['DATABASE_CURSOR']
+        
+        # Создаем таблицу users если она вдруг не создана
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT DEFAULT 'editor',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        return conn, cursor
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения соединения с БД: {e}")
+        # Если что-то пошло не так, создаем новое соединение
+        init_database()
+        return app.config.get('DATABASE_CONN'), app.config.get('DATABASE_CURSOR')
 
 # Маршруты
 @app.route('/')
@@ -88,17 +105,42 @@ def login():
             username = request.form['username']
             password = request.form['password']
             
-            conn = get_db_connection()
-            user = conn.execute(
-                'SELECT * FROM users WHERE username = ?', 
-                (username,)
-            ).fetchone()
-            conn.close()
+            # Получаем соединение с БД
+            conn, cursor = get_db_connection()
             
-            if user and check_password_hash(user['password_hash'], password):
-                session['user_id'] = user['id']
-                session['username'] = user['username']
-                session['role'] = user['role']
+            # Создаем таблицу users если она не существует
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    role TEXT DEFAULT 'editor',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Проверяем, есть ли пользователи в базе
+            cursor.execute('SELECT COUNT(*) FROM users')
+            user_count = cursor.fetchone()[0]
+            
+            # Если база пустая, создаем администратора
+            if user_count == 0:
+                password_hash = generate_password_hash('admin123')
+                cursor.execute(
+                    'INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)',
+                    ('admin', password_hash, 'admin')
+                )
+                conn.commit()
+                logger.info("✅ Администратор добавлен в пустую базу")
+            
+            # Ищем пользователя
+            cursor.execute('SELECT * FROM users WHERE username = ?', (username,))
+            user = cursor.fetchone()
+            
+            if user and check_password_hash(user[2], password):  # user[2] = password_hash
+                session['user_id'] = user[0]
+                session['username'] = user[1]
+                session['role'] = user[3]
                 logger.info(f"✅ Пользователь {username} вошел в систему")
                 return redirect(url_for('dashboard'))
             
@@ -109,7 +151,16 @@ def login():
     
     except Exception as e:
         logger.error(f"❌ Ошибка в login: {e}")
-        return f"Ошибка сервера: {e}", 500
+        return f'''
+        <html>
+        <body>
+            <h1>Ошибка базы данных</h1>
+            <p>Перезагрузите страницу или попробуйте снова через минуту.</p>
+            <p>Ошибка: {str(e)}</p>
+            <a href="/login">Попробовать снова</a>
+        </body>
+        </html>
+        ''', 500
 
 @app.route('/logout')
 def logout():
@@ -129,14 +180,70 @@ def dashboard():
     return f'''
     <!DOCTYPE html>
     <html>
-    <head><title>Дашборд</title></head>
+    <head>
+        <title>Дашборд тренировок</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; padding: 20px; }}
+            .status {{ padding: 10px; margin: 10px 0; border-radius: 5px; }}
+            .success {{ background: #d4edda; color: #155724; }}
+            .warning {{ background: #fff3cd; color: #856404; }}
+            .danger {{ background: #f8d7da; color: #721c24; }}
+            a {{ display: inline-block; margin-top: 20px; padding: 10px 20px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; }}
+        </style>
+    </head>
     <body>
         <h1>📊 Дашборд тренировок</h1>
-        <p>Привет, {session.get("username")}!</p>
+        <p>Привет, <strong>{session.get("username")}</strong>!</p>
+        
         <h2>Статус подключений:</h2>
-        <p>Telegram бот: {telegram_status}</p>
-        <p>Telegram канал: {channel_status}</p>
-        <a href="/logout">Выйти</a>
+        
+        <div class="status {'success' if Config.TELEGRAM_BOT_TOKEN else 'danger'}">
+            <strong>Telegram бот:</strong> {telegram_status}
+        </div>
+        
+        <div class="status {'success' if Config.TELEGRAM_CHANNEL_ID else 'danger'}">
+            <strong>Telegram канал:</strong> {channel_status}
+        </div>
+        
+        <h3>Быстрые действия:</h3>
+        <ul>
+            <li><a href="/test-telegram" style="background: #28a745;">📡 Проверить Telegram</a></li>
+            <li><a href="/posts" style="background: #17a2b8;">📝 Управление постами</a></li>
+            <li><a href="/logout" style="background: #dc3545;">🚪 Выйти</a></li>
+        </ul>
+    </body>
+    </html>
+    '''
+
+@app.route('/test-telegram')
+def test_telegram():
+    """Тест Telegram подключения"""
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    return '''
+    <html>
+    <body>
+        <h1>Тест Telegram</h1>
+        <p>Функция тестирования Telegram будет доступна после настройки TELEGRAM_BOT_TOKEN.</p>
+        <p>Добавьте токен в переменные окружения на Render.</p>
+        <a href="/dashboard">Назад в дашборд</a>
+    </body>
+    </html>
+    '''
+
+@app.route('/posts')
+def posts():
+    """Страница постов"""
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    return '''
+    <html>
+    <body>
+        <h1>Управление постами</h1>
+        <p>Функция управления постами будет доступна после настройки Telegram.</p>
+        <a href="/dashboard">Назад в дашборд</a>
     </body>
     </html>
     '''
@@ -148,6 +255,7 @@ def health():
         "status": "healthy",
         "service": "training-plans-dashboard",
         "timestamp": datetime.now().isoformat(),
+        "database": "sqlite-in-memory",
         "telegram_configured": bool(Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHANNEL_ID)
     })
 
@@ -156,11 +264,44 @@ def test():
     """Тестовая страница"""
     return "✅ Приложение работает корректно!"
 
+@app.route('/debug/db')
+def debug_db():
+    """Отладка базы данных"""
+    try:
+        conn, cursor = get_db_connection()
+        
+        # Пытаемся создать таблицу
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS debug_test (
+                id INTEGER PRIMARY KEY,
+                message TEXT
+            )
+        ''')
+        
+        # Добавляем тестовую запись
+        cursor.execute('INSERT INTO debug_test (message) VALUES (?)', ('Тестовая запись',))
+        conn.commit()
+        
+        # Читаем запись
+        cursor.execute('SELECT * FROM debug_test')
+        result = cursor.fetchall()
+        
+        return jsonify({
+            "status": "success",
+            "database": "working",
+            "test_data": result
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        })
+
 # Инициализация при запуске
 if __name__ == '__main__':
-    Config.validate()
-    with app.app_context():
-        init_database()
+    # Инициализируем базу данных при запуске
+    init_database()
     
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
