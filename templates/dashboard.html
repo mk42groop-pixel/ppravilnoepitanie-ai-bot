@@ -5,243 +5,130 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Дашборд - Тренировки Pro</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css" rel="stylesheet">
     <style>
-        .stat-card {
-            transition: transform 0.2s;
-            border-radius: 10px;
-        }
-        .stat-card:hover {
-            transform: translateY(-5px);
-        }
+        .stat-card { transition: transform 0.2s; border-radius: 10px; }
+        .stat-card:hover { transform: translateY(-5px); }
     </style>
 </head>
 <body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+    <nav class="navbar navbar-dark bg-dark">
         <div class="container-fluid">
-            <a class="navbar-brand" href="{{ url_for('dashboard') }}">
-                <i class="bi bi-speedometer2"></i> Тренировки Pro
-            </a>
+            <span class="navbar-brand">📊 Тренировки Pro</span>
             <div class="navbar-nav ms-auto">
-                <span class="navbar-text me-3">
-                    <i class="bi bi-person-circle"></i> {{ username }}
-                </span>
-                <a class="btn btn-outline-light btn-sm" href="{{ url_for('logout') }}">
-                    <i class="bi bi-box-arrow-right"></i> Выйти
-                </a>
+                <span class="navbar-text me-3">{{ username }}</span>
+                <a class="btn btn-outline-light btn-sm" href="{{ url_for('logout') }}">Выйти</a>
             </div>
         </div>
     </nav>
     
     <div class="container-fluid mt-4">
         <div class="row">
-            <!-- Sidebar -->
             <div class="col-md-3">
                 <div class="card mb-4">
                     <div class="card-body">
-                        <h5 class="card-title"><i class="bi bi-menu-button"></i> Меню</h5>
-                        <div class="list-group list-group-flush">
-                            <a href="{{ url_for('dashboard') }}" class="list-group-item list-group-item-action active">
-                                <i class="bi bi-house-door"></i> Дашборд
-                            </a>
-                            <a href="{{ url_for('posts') }}" class="list-group-item list-group-item-action">
-                                <i class="bi bi-file-post"></i> Посты
-                            </a>
-                            <a href="{{ url_for('templates') }}" class="list-group-item list-group-item-action">
-                                <i class="bi bi-file-earmark-text"></i> Шаблоны
-                            </a>
-                            <a href="{{ url_for('create_post') }}" class="list-group-item list-group-item-action">
-                                <i class="bi bi-plus-circle"></i> Создать пост
-                            </a>
+                        <h5 class="card-title">Меню</h5>
+                        <div class="list-group">
+                            <a href="{{ url_for('dashboard') }}" class="list-group-item active">Дашборд</a>
+                            <a href="{{ url_for('posts') }}" class="list-group-item">Посты</a>
+                            <a href="{{ url_for('create_post') }}" class="list-group-item">Создать пост</a>
                         </div>
                     </div>
                 </div>
                 
-                <!-- Статус Telegram -->
                 <div class="card">
                     <div class="card-body">
-                        <h5 class="card-title"><i class="bi bi-telegram"></i> Telegram</h5>
+                        <h5 class="card-title">Telegram</h5>
                         <div class="mb-2">
-                            <small class="text-muted">Статус бота:</small>
+                            <small>Бот: </small>
                             {% if telegram_bot_token != "Не настроен" %}
-                                <span class="badge bg-success">✅ Настроен</span>
+                                <span class="badge bg-success">✅</span>
                             {% else %}
-                                <span class="badge bg-danger">❌ Не настроен</span>
+                                <span class="badge bg-danger">❌</span>
                             {% endif %}
                         </div>
-                        <div class="mb-2">
-                            <small class="text-muted">Статус канала:</small>
-                            {% if telegram_channel_id %}
-                                <span class="badge bg-success">✅ Настроен</span>
-                            {% else %}
-                                <span class="badge bg-danger">❌ Не настроен</span>
-                            {% endif %}
-                        </div>
-                        <button class="btn btn-sm btn-outline-primary w-100" onclick="testTelegram()">
-                            <i class="bi bi-plug"></i> Проверить подключение
-                        </button>
+                        <button class="btn btn-sm btn-primary w-100" onclick="testTelegram()">Проверить</button>
                     </div>
                 </div>
             </div>
             
-            <!-- Main content -->
             <div class="col-md-9">
-                <h1 class="mb-4"><i class="bi bi-speedometer2"></i> Дашборд</h1>
+                <h1>Дашборд</h1>
                 
-                <!-- Статистика -->
                 <div class="row mb-4">
                     <div class="col-md-4 mb-3">
-                        <div class="card stat-card bg-primary text-white">
+                        <div class="card bg-primary text-white">
                             <div class="card-body">
-                                <div class="d-flex justify-content-between align-items-center">
-                                    <div>
-                                        <h6 class="card-subtitle">Всего постов</h6>
-                                        <h2 class="card-title">{{ total_posts }}</h2>
-                                    </div>
-                                    <i class="bi bi-file-post fs-1 opacity-50"></i>
-                                </div>
+                                <h6>Всего постов</h6>
+                                <h2>{{ total_posts }}</h2>
                             </div>
                         </div>
                     </div>
                     <div class="col-md-4 mb-3">
-                        <div class="card stat-card bg-success text-white">
+                        <div class="card bg-success text-white">
                             <div class="card-body">
-                                <div class="d-flex justify-content-between align-items-center">
-                                    <div>
-                                        <h6 class="card-subtitle">Опубликовано</h6>
-                                        <h2 class="card-title">{{ published_posts }}</h2>
-                                    </div>
-                                    <i class="bi bi-check-circle fs-1 opacity-50"></i>
-                                </div>
+                                <h6>Опубликовано</h6>
+                                <h2>{{ published_posts }}</h2>
                             </div>
                         </div>
                     </div>
                     <div class="col-md-4 mb-3">
-                        <div class="card stat-card bg-warning text-white">
+                        <div class="card bg-warning text-white">
                             <div class="card-body">
-                                <div class="d-flex justify-content-between align-items-center">
-                                    <div>
-                                        <h6 class="card-subtitle">Черновики</h6>
-                                        <h2 class="card-title">{{ drafts_count }}</h2>
-                                    </div>
-                                    <i class="bi bi-pencil fs-1 opacity-50"></i>
-                                </div>
+                                <h6>Черновики</h6>
+                                <h2>{{ drafts_count }}</h2>
                             </div>
                         </div>
                     </div>
                 </div>
                 
-                <!-- Последние посты -->
                 <div class="card mb-4">
-                    <div class="card-header d-flex justify-content-between align-items-center">
+                    <div class="card-header">
                         <h5 class="mb-0">Последние посты</h5>
-                        <a href="{{ url_for('posts') }}" class="btn btn-sm btn-outline-primary">Все посты</a>
                     </div>
                     <div class="card-body">
                         {% if recent_posts %}
-                        <div class="table-responsive">
-                            <table class="table table-hover">
-                                <thead>
-                                    <tr>
-                                        <th>Заголовок</th>
-                                        <th>Статус</th>
-                                        <th>Дата</th>
-                                        <th>Действия</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {% for post in recent_posts %}
-                                    <tr>
-                                        <td>
-                                            <strong>{{ post.title[:40] }}{% if post.title|length > 40 %}...{% endif %}</strong>
-                                            {% if post.media_url %}
-                                            <i class="bi bi-image text-info ms-1"></i>
-                                            {% endif %}
-                                        </td>
-                                        <td>
-                                            {% if post.status == 'published' %}
-                                                <span class="badge bg-success">Опубликован</span>
-                                            {% elif post.status == 'scheduled' %}
-                                                <span class="badge bg-warning">Запланирован</span>
-                                            {% else %}
-                                                <span class="badge bg-secondary">Черновик</span>
-                                            {% endif %}
-                                        </td>
-                                        <td>{{ post.created_at[:10] }}</td>
-                                        <td>
-                                            {% if post.status == 'draft' %}
-                                            <a href="{{ url_for('publish_post', post_id=post.id) }}" 
-                                               class="btn btn-sm btn-success"
-                                               onclick="return confirm('Опубликовать этот пост?')">
-                                                <i class="bi bi-send"></i>
-                                            </a>
-                                            {% endif %}
-                                        </td>
-                                    </tr>
-                                    {% endfor %}
-                                </tbody>
-                            </table>
-                        </div>
-                        {% else %}
-                        <div class="text-center py-4">
-                            <i class="bi bi-file-text fs-1 text-muted"></i>
-                            <p class="text-muted mt-2">Нет постов для отображения</p>
-                            <a href="{{ url_for('create_post') }}" class="btn btn-primary">
-                                <i class="bi bi-plus-circle"></i> Создать первый пост
-                            </a>
-                        </div>
-                        {% endif %}
-                    </div>
-                </div>
-                
-                <!-- Информация -->
-                <div class="card">
-                    <div class="card-body">
-                        <h5 class="card-title"><i class="bi bi-info-circle"></i> Информация</h5>
-                        <div class="row">
-                            <div class="col-md-6">
-                                <h6>Как создать пост:</h6>
-                                <ol class="small">
-                                    <li>Нажмите "Создать пост" в меню</li>
-                                    <li>Заполните заголовок и содержание</li>
-                                    <li>Добавьте теги и изображение</li>
-                                    <li>Выберите "Опубликовать сразу"</li>
-                                    <li>Пост отправится в Telegram</li>
-                                </ol>
-                            </div>
-                            <div class="col-md-6">
-                                <h6>Статистика:</h6>
-                                <ul class="small">
-                                    <li><strong>Всего постов:</strong> {{ total_posts }}</li>
-                                    <li><strong>Опубликовано:</strong> {{ published_posts }}</li>
-                                    <li><strong>Черновиков:</strong> {{ drafts_count }}</li>
-                                    {% if last_post %}
-                                    <li><strong>Последний пост:</strong> {{ last_post['published_time'][:16] }}</li>
+                        <table class="table">
+                            {% for post in recent_posts %}
+                            <tr>
+                                <td>{{ post.title[:40] }}{% if post.title|length > 40 %}...{% endif %}</td>
+                                <td>
+                                    {% if post.status == 'published' %}
+                                        <span class="badge bg-success">Опубликован</span>
+                                    {% else %}
+                                        <span class="badge bg-secondary">Черновик</span>
                                     {% endif %}
-                                </ul>
-                            </div>
-                        </div>
+                                </td>
+                                <td>
+                                    {% if post.status == 'draft' %}
+                                    <a href="{{ url_for('publish_post', post_id=post.id) }}" 
+                                       class="btn btn-sm btn-success"
+                                       onclick="return confirm('Опубликовать?')">
+                                        📤
+                                    </a>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </table>
+                        {% else %}
+                        <p class="text-center">Нет постов</p>
+                        {% endif %}
                     </div>
                 </div>
             </div>
         </div>
     </div>
     
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
     function testTelegram() {
         fetch('/test-telegram')
             .then(response => response.json())
             .then(data => {
                 if (data.success) {
-                    alert('✅ Тестовое сообщение отправлено в Telegram!');
+                    alert('✅ Тест отправлен в Telegram!');
                 } else {
-                    alert('❌ Ошибка: ' + data.message + '\\n\\nПроверьте:\\n' + data.check.join('\\n'));
+                    alert('❌ Ошибка: ' + data.message);
                 }
-            })
-            .catch(error => {
-                console.error('Error:', error);
-                alert('❌ Ошибка при проверке подключения');
             });
     }
     </script>
