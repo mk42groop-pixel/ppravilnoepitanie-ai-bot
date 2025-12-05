@@ -18,8 +18,6 @@ logger = logging.getLogger(__name__)
 # ==================== ИНИЦИАЛИЗАЦИЯ FLASK ====================
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
-app.config['SESSION_TYPE'] = 'filesystem'
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
 
 # ==================== КОНФИГУРАЦИЯ ====================
 class Config:
